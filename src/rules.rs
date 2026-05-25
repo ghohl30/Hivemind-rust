@@ -261,25 +261,31 @@ pub fn membership_triple(board: &Board, c: Coord) -> (bool, bool, bool) {
     (in_perim, in_white, in_black)
 }
 
-/// From-scratch perimeter set. Used by tests to validate the incremental cache.
-pub fn perimeter_from_scratch(board: &Board) -> std::collections::HashSet<Coord> {
-    let mut out = std::collections::HashSet::new();
+/// From-scratch perimeter set, returned as a sorted `Vec<Coord>`. Used by
+/// tests to validate the incremental cache (which is now itself a sorted
+/// CoordSet — comparing as slices works directly).
+pub fn perimeter_from_scratch(board: &Board) -> Vec<Coord> {
+    let mut seen: std::collections::HashSet<Coord> = std::collections::HashSet::new();
     for c in board.occupied_coords() {
         for n in c.neighbours() {
             if !board.is_occupied(n) {
-                out.insert(n);
+                seen.insert(n);
             }
         }
     }
+    let mut out: Vec<Coord> = seen.into_iter().collect();
+    out.sort();
     out
 }
 
-/// From-scratch placement-legality set for one color.
-pub fn placement_legality_from_scratch(board: &Board, color: Color) -> std::collections::HashSet<Coord> {
-    perimeter_from_scratch(board)
+/// From-scratch placement-legality set for one color, sorted by Coord.
+pub fn placement_legality_from_scratch(board: &Board, color: Color) -> Vec<Coord> {
+    let mut out: Vec<Coord> = perimeter_from_scratch(board)
         .into_iter()
         .filter(|c| is_legal_placement_for(board, color, *c))
-        .collect()
+        .collect();
+    out.sort();
+    out
 }
 
 /// Tarjan articulation-point detection over the hive (≤22 vertices, max 6

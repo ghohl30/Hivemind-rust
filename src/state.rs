@@ -20,7 +20,38 @@ use crate::rules::{
 };
 use crate::zobrist::{piece_key, SIDE_TO_MOVE_KEY};
 
-/// Add/remove pair describing how a HashSet<Coord> changed across one `apply`.
+/// Sorted-by-Coord bounded set. Phase 5: replaces the per-State HashSet caches
+/// (perimeter, placement_legality_*). Inline storage avoids SipHash and the
+/// per-allocation overhead the HashSet pays. 32 inline slots fits the typical
+/// hive perimeter; a wide linear hive may spill to heap once but won't repeat
+/// the allocation thereafter.
+pub type CoordSet = SmallVec<[Coord; 32]>;
+
+/// Insert `c` into a sorted CoordSet. Returns true if newly inserted.
+#[inline]
+fn cs_insert(set: &mut CoordSet, c: Coord) -> bool {
+    match set.binary_search(&c) {
+        Ok(_) => false,
+        Err(i) => {
+            set.insert(i, c);
+            true
+        }
+    }
+}
+
+/// Remove `c` from a sorted CoordSet. Returns true if it was present.
+#[inline]
+fn cs_remove(set: &mut CoordSet, c: Coord) -> bool {
+    match set.binary_search(&c) {
+        Ok(i) => {
+            set.remove(i);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Add/remove pair describing how a CoordSet changed across one `apply`.
 /// Inline up to 8 entries per direction — typical moves change very few cells.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SetDelta {
@@ -29,28 +60,13 @@ pub struct SetDelta {
 }
 
 impl SetDelta {
-    #[allow(dead_code)]
-    fn apply(&self, set: &mut HashSet<Coord>) {
-        for c in &self.removed {
-            set.remove(c);
-        }
+    fn reverse(&self, set: &mut CoordSet) {
         for c in &self.added {
-            set.insert(*c);
-        }
-    }
-
-    fn reverse(&self, set: &mut HashSet<Coord>) {
-        for c in &self.added {
-            set.remove(c);
+            cs_remove(set, *c);
         }
         for c in &self.removed {
-            set.insert(*c);
+            cs_insert(set, *c);
         }
-    }
-
-    #[allow(dead_code)]
-    fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty()
     }
 }
 
@@ -127,13 +143,14 @@ pub struct State {
     /// Phase 4: empty cells adjacent to the hive. Maintained incrementally
     /// via deltas in `UndoRecord`. Invariant: equals
     /// `rules::perimeter_from_scratch(&self.board)` after every apply/unapply.
-    perimeter: HashSet<Coord>,
+    /// Phase 5: sorted CoordSet (was `HashSet<Coord>`).
+    perimeter: CoordSet,
     /// Per-color general placement-legality (post-opening). A cell is in the
     /// set iff it is empty, touches ≥1 own-color top neighbour, and 0
     /// enemy-color top neighbours. Opening special cases (placements_so_far
     /// < 2) are handled in `gen`, not in this cache.
-    placement_legality_white: HashSet<Coord>,
-    placement_legality_black: HashSet<Coord>,
+    placement_legality_white: CoordSet,
+    placement_legality_black: CoordSet,
     /// Make-unmake history. `apply` pushes, `unapply` pops. Cloning a state
     /// clones its undo stack, which is rarely what callers want in a search —
     /// prefer make-unmake on `&mut State`.
@@ -158,15 +175,16 @@ impl State {
             // Empty board + White to move ⇒ hash 0. SIDE_TO_MOVE_KEY is only
             // XOR'd when side_to_move is Black.
             zobrist: 0,
-            perimeter: HashSet::new(),
-            placement_legality_white: HashSet::new(),
-            placement_legality_black: HashSet::new(),
+            perimeter: CoordSet::new(),
+            placement_legality_white: CoordSet::new(),
+            placement_legality_black: CoordSet::new(),
             undo_stack: Vec::new(),
         }
     }
 
     /// Cached empty-cells-adjacent-to-hive set. Phase 4 incremental cache.
-    pub fn perimeter(&self) -> &HashSet<Coord> {
+    /// Returned as a sorted slice (was `&HashSet<Coord>` before Phase 5).
+    pub fn perimeter(&self) -> &[Coord] {
         &self.perimeter
     }
 
@@ -174,7 +192,7 @@ impl State {
     /// incremental cache. NOTE: callers in the very first two placements of
     /// the game must use the opening-special-case logic in `gen`, not this
     /// cache — the cache reflects the general rule only.
-    pub fn placement_legality(&self, color: Color) -> &HashSet<Coord> {
+    pub fn placement_legality(&self, color: Color) -> &[Coord] {
         match color {
             Color::White => &self.placement_legality_white,
             Color::Black => &self.placement_legality_black,
@@ -387,28 +405,28 @@ impl State {
             let (is_p, is_w, is_b) = membership_triple(&self.board, c);
             if was_p != is_p {
                 if is_p {
-                    self.perimeter.insert(c);
+                    cs_insert(&mut self.perimeter, c);
                     perimeter_delta.added.push(c);
                 } else {
-                    self.perimeter.remove(&c);
+                    cs_remove(&mut self.perimeter, c);
                     perimeter_delta.removed.push(c);
                 }
             }
             if was_w != is_w {
                 if is_w {
-                    self.placement_legality_white.insert(c);
+                    cs_insert(&mut self.placement_legality_white, c);
                     white_legality_delta.added.push(c);
                 } else {
-                    self.placement_legality_white.remove(&c);
+                    cs_remove(&mut self.placement_legality_white, c);
                     white_legality_delta.removed.push(c);
                 }
             }
             if was_b != is_b {
                 if is_b {
-                    self.placement_legality_black.insert(c);
+                    cs_insert(&mut self.placement_legality_black, c);
                     black_legality_delta.added.push(c);
                 } else {
-                    self.placement_legality_black.remove(&c);
+                    cs_remove(&mut self.placement_legality_black, c);
                     black_legality_delta.removed.push(c);
                 }
             }
