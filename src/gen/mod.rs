@@ -96,7 +96,7 @@ pub fn generate_movements(state: &State, color: Color, out: &mut SmallVec<[Move;
                 // Beetles on top of a stack (stack_height > 0) are always
                 // movable regardless of articulation — lifting them doesn't
                 // change which coords are occupied.
-                if stack_height == 0 && articulations.contains(&coord) {
+                if stack_height == 0 && articulations.binary_search(&coord).is_ok() {
                     continue;
                 }
                 let from = coord;
