@@ -124,12 +124,14 @@ fn assert_round_trip(s: &mut State, m: hive_engine::Move) {
 }
 
 /// Phase 4 invariant: the incrementally-maintained `perimeter` and
-/// `placement_legality_*` caches equal their from-scratch builds.
+/// `placement_legality_*` caches equal their from-scratch builds. Both sides
+/// of the comparison are sorted slices of Coord (Phase 5 changed the caches
+/// from HashSet<Coord> to a sorted CoordSet).
 fn assert_caches_match_from_scratch(s: &State) {
     let perim_built = perimeter_from_scratch(s.board());
     assert_eq!(
         s.perimeter(),
-        &perim_built,
+        perim_built.as_slice(),
         "perimeter cache drift: incremental={:?}, from_scratch={:?}",
         s.perimeter(),
         perim_built,
@@ -138,7 +140,7 @@ fn assert_caches_match_from_scratch(s: &State) {
         let built = placement_legality_from_scratch(s.board(), color);
         assert_eq!(
             s.placement_legality(color),
-            &built,
+            built.as_slice(),
             "placement_legality({color:?}) drift: incremental={:?}, from_scratch={:?}",
             s.placement_legality(color),
             built,

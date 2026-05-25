@@ -261,111 +261,137 @@ pub fn membership_triple(board: &Board, c: Coord) -> (bool, bool, bool) {
     (in_perim, in_white, in_black)
 }
 
-/// From-scratch perimeter set. Used by tests to validate the incremental cache.
-pub fn perimeter_from_scratch(board: &Board) -> std::collections::HashSet<Coord> {
-    let mut out = std::collections::HashSet::new();
+/// From-scratch perimeter set, returned as a sorted `Vec<Coord>`. Used by
+/// tests to validate the incremental cache (which is now itself a sorted
+/// CoordSet — comparing as slices works directly).
+pub fn perimeter_from_scratch(board: &Board) -> Vec<Coord> {
+    let mut seen: std::collections::HashSet<Coord> = std::collections::HashSet::new();
     for c in board.occupied_coords() {
         for n in c.neighbours() {
             if !board.is_occupied(n) {
-                out.insert(n);
+                seen.insert(n);
             }
         }
     }
+    let mut out: Vec<Coord> = seen.into_iter().collect();
+    out.sort();
     out
 }
 
-/// From-scratch placement-legality set for one color.
-pub fn placement_legality_from_scratch(board: &Board, color: Color) -> std::collections::HashSet<Coord> {
-    perimeter_from_scratch(board)
+/// From-scratch placement-legality set for one color, sorted by Coord.
+pub fn placement_legality_from_scratch(board: &Board, color: Color) -> Vec<Coord> {
+    let mut out: Vec<Coord> = perimeter_from_scratch(board)
         .into_iter()
         .filter(|c| is_legal_placement_for(board, color, *c))
-        .collect()
+        .collect();
+    out.sort();
+    out
 }
 
 /// Tarjan articulation-point detection over the hive (≤22 vertices, max 6
-/// edges per vertex). Returns the set of coords whose removal would
-/// disconnect the hive — these are the ground-level pieces that cannot move
-/// without violating the One Hive rule.
+/// edges per vertex). Returns the coords whose removal would disconnect the
+/// hive — the ground-level pieces that cannot move without violating One Hive.
 ///
 /// Used by `gen::generate_movements` to classify all pieces in one pass
 /// instead of running an independent connectivity check per piece.
-pub fn articulation_points(board: &Board) -> std::collections::HashSet<Coord> {
-    use std::collections::HashMap;
-    let coords: Vec<Coord> = board.occupied_coords().collect();
-    let n = coords.len();
+///
+/// All working storage is stack-allocated (n ≤ 22), and the returned list is
+/// inline in a `SmallVec`. The result is sorted by `Coord` because we walk
+/// `coords[..]` (already sorted by Board) in ascending order — callers can
+/// `binary_search` for membership.
+pub fn articulation_points(board: &Board) -> smallvec::SmallVec<[Coord; 22]> {
+    const MAX: usize = 22;
+    // Collect occupied coords. Board guarantees ascending order, so `coords`
+    // is sorted — that lets us do a binary search for coord→index lookup
+    // instead of carrying a HashMap.
+    let mut coords: [Coord; MAX] = [Coord::ORIGIN; MAX];
+    let mut n: usize = 0;
+    for c in board.occupied_coords() {
+        coords[n] = c;
+        n += 1;
+    }
     if n <= 1 {
-        return std::collections::HashSet::new();
+        return smallvec::SmallVec::new();
     }
-    let mut idx: HashMap<Coord, usize> = HashMap::with_capacity(n);
-    for (i, c) in coords.iter().enumerate() {
-        idx.insert(*c, i);
-    }
-    // Neighbour adjacency in vertex-index space.
-    let mut adj: Vec<smallvec::SmallVec<[usize; 6]>> = vec![smallvec::SmallVec::new(); n];
-    for (i, c) in coords.iter().enumerate() {
-        for n_c in c.neighbours() {
-            if let Some(&j) = idx.get(&n_c) {
-                adj[i].push(j);
+    // Build adjacency in vertex-index space.
+    let mut adj_count = [0u8; MAX];
+    let mut adj = [[0u8; 6]; MAX];
+    for i in 0..n {
+        for nc in coords[i].neighbours() {
+            if let Ok(j) = coords[..n].binary_search(&nc) {
+                adj[i][adj_count[i] as usize] = j as u8;
+                adj_count[i] += 1;
             }
         }
     }
-    // Iterative Tarjan with an explicit stack — keeps the call depth bounded
-    // even though n ≤ 22.
-    let mut visited = vec![false; n];
-    let mut disc = vec![0u32; n];
-    let mut low = vec![0u32; n];
-    let mut parent = vec![usize::MAX; n];
-    let mut is_art = vec![false; n];
+    // Iterative Tarjan with an explicit stack — bounded by n ≤ MAX.
+    let mut visited = [false; MAX];
+    let mut disc = [0u32; MAX];
+    let mut low = [0u32; MAX];
+    let mut parent = [u8::MAX; MAX];
+    let mut is_art = [false; MAX];
+    // Stack frame: (node, child-iterator-index). +1 slot for the initial push.
+    let mut stack: [(u8, u8); MAX + 1] = [(0, 0); MAX + 1];
+    let mut sp: usize = 0;
     let mut timer: u32 = 0;
-    // Stack frame: (node, child-iterator-index)
-    let mut stack: Vec<(usize, usize)> = Vec::with_capacity(n);
-    let root = 0;
-    visited[root] = true;
+    let root: u8 = 0;
+    visited[root as usize] = true;
     timer += 1;
-    disc[root] = timer;
-    low[root] = timer;
-    stack.push((root, 0));
-    let mut root_children = 0u32;
-    while let Some(&(u, _)) = stack.last() {
-        let i = stack.last().unwrap().1;
-        if i < adj[u].len() {
-            stack.last_mut().unwrap().1 += 1;
-            let v = adj[u][i];
-            if !visited[v] {
-                visited[v] = true;
-                parent[v] = u;
+    disc[root as usize] = timer;
+    low[root as usize] = timer;
+    stack[sp] = (root, 0);
+    sp += 1;
+    let mut root_children: u32 = 0;
+    while sp > 0 {
+        let (u, i) = stack[sp - 1];
+        let u_idx = u as usize;
+        if (i as usize) < adj_count[u_idx] as usize {
+            stack[sp - 1].1 += 1;
+            let v = adj[u_idx][i as usize];
+            let v_idx = v as usize;
+            if !visited[v_idx] {
+                visited[v_idx] = true;
+                parent[v_idx] = u;
                 timer += 1;
-                disc[v] = timer;
-                low[v] = timer;
+                disc[v_idx] = timer;
+                low[v_idx] = timer;
                 if u == root {
                     root_children += 1;
                 }
-                stack.push((v, 0));
-            } else if v != parent[u] {
-                low[u] = low[u].min(disc[v]);
+                stack[sp] = (v, 0);
+                sp += 1;
+            } else if v != parent[u_idx] {
+                if disc[v_idx] < low[u_idx] {
+                    low[u_idx] = disc[v_idx];
+                }
             }
         } else {
-            // Done with u's children. Propagate low to parent.
-            stack.pop();
-            if let Some(&(p, _)) = stack.last() {
-                low[p] = low[p].min(low[u]);
+            // Done with u's children — propagate low to parent.
+            sp -= 1;
+            if sp > 0 {
+                let p = stack[sp - 1].0;
+                let p_idx = p as usize;
+                if low[u_idx] < low[p_idx] {
+                    low[p_idx] = low[u_idx];
+                }
                 // Non-root articulation criterion.
-                if p != root && low[u] >= disc[p] {
-                    is_art[p] = true;
+                if p != root && low[u_idx] >= disc[p_idx] {
+                    is_art[p_idx] = true;
                 }
             }
         }
     }
     // Root articulation criterion.
     if root_children > 1 {
-        is_art[root] = true;
+        is_art[root as usize] = true;
     }
-    coords
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| is_art[*i])
-        .map(|(_, c)| *c)
-        .collect()
+    let mut out: smallvec::SmallVec<[Coord; 22]> = smallvec::SmallVec::new();
+    for i in 0..n {
+        if is_art[i] {
+            out.push(coords[i]);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
