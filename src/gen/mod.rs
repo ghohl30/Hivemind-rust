@@ -3,7 +3,6 @@
 //! Top-level entry points are called from `state::legal_moves`.
 
 use smallvec::SmallVec;
-use std::collections::HashSet;
 
 use crate::coord::Coord;
 use crate::moves::Move;
@@ -16,21 +15,6 @@ pub mod beetle;
 pub mod grasshopper;
 pub mod queen;
 pub mod spider;
-
-/// Empty cells adjacent to the hive. For the initial empty board this is
-/// `{ORIGIN}` only when handled at the call site.
-pub fn perimeter_coords(state: &State) -> HashSet<Coord> {
-    let board = state.board();
-    let mut out: HashSet<Coord> = HashSet::new();
-    for c in board.occupied_coords() {
-        for n in c.neighbours() {
-            if !board.is_occupied(n) {
-                out.insert(n);
-            }
-        }
-    }
-    out
-}
 
 /// Candidate placement coords for `color`. After the opening's two special
 /// cases, we just read `state.placement_legality(color)` — the Phase 4 cache

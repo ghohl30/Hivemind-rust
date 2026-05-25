@@ -6,8 +6,6 @@
 //! placement-legality caches. Round-trip equality is guarded by the property
 //! test in `tests/proptest_invariants.rs`.
 
-use std::collections::HashSet;
-
 use smallvec::SmallVec;
 
 use crate::board::Board;
@@ -72,24 +70,33 @@ impl SetDelta {
 
 /// Cells whose membership in `perimeter` / `placement_legality_*` might change
 /// across `m`. Conservative: includes `from`, `to`, and each of their six
-/// neighbours; duplicates are removed via the HashSet.
-fn affected_coords_for(m: Move, from: Option<Coord>) -> HashSet<Coord> {
-    let mut out: HashSet<Coord> = HashSet::with_capacity(16);
+/// neighbours. Returned sorted and deduplicated as an inline SmallVec — at
+/// most 14 cells (Slide) so the inline 16-slot buffer never spills.
+fn affected_coords_for(m: Move, from: Option<Coord>) -> SmallVec<[Coord; 16]> {
+    let mut out: SmallVec<[Coord; 16]> = SmallVec::new();
     match m {
-        Move::Pass => {}
+        Move::Pass => return out,
         Move::Place { to, .. } => {
-            out.insert(to);
-            out.extend(to.neighbours().iter().copied());
+            out.push(to);
+            for n in to.neighbours() {
+                out.push(n);
+            }
         }
         Move::Slide { to, .. } => {
             if let Some(f) = from {
-                out.insert(f);
-                out.extend(f.neighbours().iter().copied());
+                out.push(f);
+                for n in f.neighbours() {
+                    out.push(n);
+                }
             }
-            out.insert(to);
-            out.extend(to.neighbours().iter().copied());
+            out.push(to);
+            for n in to.neighbours() {
+                out.push(n);
+            }
         }
     }
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -311,13 +318,10 @@ impl State {
             },
             _ => None,
         };
-        // Sort the affected coords so delta vec ordering is deterministic
-        // across runs (HashSet iteration order is randomized, which would
-        // otherwise break `apply_deterministic`).
+        // `affected` is already sorted+deduped; iteration order is therefore
+        // deterministic (needed for `apply_deterministic`).
         let affected = affected_coords_for(m, current_from);
-        let mut affected_sorted: SmallVec<[Coord; 16]> = affected.into_iter().collect();
-        affected_sorted.sort();
-        let pre: SmallVec<[(Coord, bool, bool, bool); 16]> = affected_sorted
+        let pre: SmallVec<[(Coord, bool, bool, bool); 16]> = affected
             .iter()
             .map(|c| {
                 let (p, w, b) = membership_triple(&self.board, *c);

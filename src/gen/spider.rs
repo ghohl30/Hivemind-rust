@@ -4,9 +4,13 @@
 //! as in `gen/ant.rs`: slide-gap already implies hive contact at the new
 //! cell (the occupied flank from the XOR check is itself a neighbour of
 //! `next` and not the lifted piece). Proptest + perft counts unchanged.
+//!
+//! Phase 5 (perf branch): `visited` is the DFS path stack (push on descend,
+//! pop on return), and `destinations` is push-only with a final sort+dedup.
+//! Max recursion depth is 3, so `visited` holds at most 4 entries — linear
+//! `contains` is faster than binary search at that size.
 
 use smallvec::SmallVec;
-use std::collections::HashSet;
 
 use crate::coord::Coord;
 use crate::moves::Move;
@@ -16,10 +20,12 @@ use crate::state::State;
 
 pub fn generate(state: &State, pid: PieceId, from: Coord, out: &mut SmallVec<[Move; 64]>) {
     let board = state.board();
-    let mut destinations: HashSet<Coord> = HashSet::new();
-    let mut visited: HashSet<Coord> = HashSet::new();
-    visited.insert(from);
+    let mut destinations: SmallVec<[Coord; 16]> = SmallVec::new();
+    let mut visited: SmallVec<[Coord; 8]> = SmallVec::new();
+    visited.push(from);
     dfs(board, from, from, 0, 3, &mut visited, &mut destinations);
+    destinations.sort();
+    destinations.dedup();
     for d in destinations {
         out.push(Move::Slide { piece: pid, to: d });
     }
@@ -31,11 +37,11 @@ fn dfs(
     current: Coord,
     depth: u8,
     target: u8,
-    visited: &mut HashSet<Coord>,
-    out: &mut HashSet<Coord>,
+    visited: &mut SmallVec<[Coord; 8]>,
+    out: &mut SmallVec<[Coord; 16]>,
 ) {
     if depth == target {
-        out.insert(current);
+        out.push(current);
         return;
     }
     for next in current.neighbours() {
@@ -48,8 +54,8 @@ fn dfs(
         if !can_slide_with_lifted(board, current, next, lifted_from) {
             continue;
         }
-        visited.insert(next);
+        visited.push(next);
         dfs(board, lifted_from, next, depth + 1, target, visited, out);
-        visited.remove(&next);
+        visited.pop();
     }
 }
