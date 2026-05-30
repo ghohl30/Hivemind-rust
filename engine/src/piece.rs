@@ -7,6 +7,7 @@
 use crate::coord::Coord;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum Color {
     White = 0,
@@ -23,6 +24,7 @@ impl Color {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum PieceType {
     QueenBee = 0,
@@ -37,6 +39,7 @@ pub enum PieceType {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PieceId(pub u8);
 
 impl PieceId {
@@ -103,6 +106,7 @@ pub const fn queen_of(c: Color) -> PieceId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PieceSlot {
     InHand,
     OnBoard { coord: Coord, stack_height: u8 },
@@ -127,6 +131,7 @@ impl PieceSlot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct StackTop {
     pub piece: PieceId,
     pub height: u8,

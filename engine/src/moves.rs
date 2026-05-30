@@ -9,6 +9,7 @@ use crate::coord::Coord;
 use crate::piece::PieceId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Move {
     Place { piece: PieceId, to: Coord },
     Slide { piece: PieceId, to: Coord },

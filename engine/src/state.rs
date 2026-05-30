@@ -101,6 +101,7 @@ fn affected_coords_for(m: Move, from: Option<Coord>) -> SmallVec<[Coord; 16]> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Outcome {
     Win(Color),
     Draw,
@@ -238,6 +239,38 @@ impl State {
 
     pub fn board(&self) -> &Board {
         &self.board
+    }
+
+    /// Convenience shortcut for `self.board().entries()`: every on-board stack
+    /// top as `(Coord, StackTop)` where `StackTop { piece, height }`. Sorted by
+    /// coord (the board keeps `occupied` sorted). For rendering the top layer.
+    pub fn entries(&self) -> impl Iterator<Item = (Coord, StackTop)> + '_ {
+        self.board.entries()
+    }
+
+    /// The full stack at `c`, bottom-to-top: index `i` is the piece at
+    /// `stack_height == i`, so the last element is the current top. Empty if
+    /// the cell is unoccupied. Reconstructed from the `pieces` array (the board
+    /// only stores tops), so beetle stacks can be drawn layer-by-layer without
+    /// the caller scanning all 22 slots itself. A cell holds at most a handful
+    /// of pieces (a ground piece plus climbing beetles), well within the inline
+    /// buffer.
+    pub fn stack_at(&self, c: Coord) -> SmallVec<[PieceId; 8]> {
+        // Collect (height, id) for every slot sitting at `c`, then order by
+        // height. Both OnBoard (the top) and Covered (buried) slots count.
+        let mut layers: SmallVec<[(u8, PieceId); 8]> = SmallVec::new();
+        for (i, slot) in self.pieces.iter().enumerate() {
+            let (coord, height) = match *slot {
+                PieceSlot::OnBoard { coord, stack_height }
+                | PieceSlot::Covered { coord, stack_height } => (coord, stack_height),
+                PieceSlot::InHand => continue,
+            };
+            if coord == c {
+                layers.push((height, PieceId(i as u8)));
+            }
+        }
+        layers.sort_by_key(|(h, _)| *h);
+        layers.into_iter().map(|(_, id)| id).collect()
     }
 
     pub fn placements_so_far(&self) -> usize {
@@ -698,6 +731,52 @@ mod tests {
         s.unapply();
         assert_eq!(s, snap);
         assert_eq!(s.undo_depth(), 0);
+    }
+
+    #[test]
+    fn stack_at_reports_layers_bottom_to_top() {
+        let mut s = State::new();
+        s.apply(Move::Place { piece: PieceId(0), to: Coord::ORIGIN });          // WQ
+        s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0) });      // BQ
+        s.apply(Move::Place { piece: PieceId(1), to: Coord::new(-1, 0) });      // WB
+        s.apply(Move::Place { piece: PieceId(12), to: Coord::new(2, 0) });      // BB
+        // White beetle climbs onto the white queen at ORIGIN.
+        s.apply(Move::Slide { piece: PieceId(1), to: Coord::ORIGIN });
+
+        // Empty cell: empty stack.
+        assert!(s.stack_at(Coord::new(5, 5)).is_empty());
+        // Ground-only cell: single layer.
+        assert_eq!(s.stack_at(Coord::new(1, 0)).as_slice(), &[PieceId(11)]);
+        // Stacked cell: queen at the bottom (height 0), beetle on top (height 1).
+        assert_eq!(s.stack_at(Coord::ORIGIN).as_slice(), &[PieceId(0), PieceId(1)]);
+        // The top of `stack_at` agrees with the board's top.
+        let top = s.board().top_at(Coord::ORIGIN).unwrap();
+        assert_eq!(*s.stack_at(Coord::ORIGIN).last().unwrap(), top.piece);
+    }
+
+    #[test]
+    fn entries_matches_board_entries() {
+        let mut s = State::new();
+        s.apply(Move::Place { piece: PieceId(0), to: Coord::ORIGIN });
+        s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0) });
+        let via_state: Vec<_> = s.entries().collect();
+        let via_board: Vec<_> = s.board().entries().collect();
+        assert_eq!(via_state, via_board);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn move_json_round_trips() {
+        let moves = [
+            Move::Place { piece: PieceId(3), to: Coord::new(1, -1) },
+            Move::Slide { piece: PieceId(0), to: Coord::ORIGIN },
+            Move::Pass,
+        ];
+        for m in moves {
+            let json = serde_json::to_string(&m).unwrap();
+            let back: Move = serde_json::from_str(&json).unwrap();
+            assert_eq!(m, back);
+        }
     }
 
     #[test]
