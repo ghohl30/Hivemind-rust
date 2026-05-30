@@ -1,0 +1,37 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        run: rustup show
+
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: build (release)
+        run: cargo build --release
+
+      # Release run is fast; debug exercises the proptest with all invariants
+      # enabled (round-trip, zobrist-from-scratch, cache-from-scratch, one-hive,
+      # terminal-consistency) — the safety net for any State / cache change.
+      - name: test (release)
+        run: cargo test --release
+
+      - name: test (debug)
+        run: cargo test
