@@ -4,6 +4,7 @@
 //!   E (+1, 0), W (-1, 0), SE (0, +1), NW (0, -1), NE (+1, -1), SW (-1, +1).
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Coord {
     pub q: i16,
     pub r: i16,
@@ -36,6 +37,7 @@ impl Coord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum Direction {
     East = 0,
