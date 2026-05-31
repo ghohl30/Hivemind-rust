@@ -110,6 +110,19 @@ pub fn App() -> impl IntoView {
                     .outcome()
                     .map(|o| view! { <OutcomeBanner outcome=o /> })
             }}
+            // The stack inspector is rendered here at the App root, as a sibling
+            // of the panels, NOT inside the board panel. The board panel has
+            // `backdrop-filter` + `overflow: hidden`, which would establish a
+            // containing block for `position: fixed` descendants and clip them;
+            // mounting the popover at the root lets `fixed` resolve against the
+            // viewport so viewport-clamping actually keeps the whole box visible.
+            {move || {
+                popover
+                    .get()
+                    .map(|p| {
+                        view! { <StackPopoverBox session=session popover=popover info=p /> }
+                    })
+            }}
         </main>
     }
 }
@@ -370,25 +383,29 @@ fn Board(
                 <button class="ctrl-btn" on:click=on_fit title="Fit board">"Fit"</button>
                 <button class="ctrl-btn" on:click=on_zoom_in title="Zoom in">"+"</button>
             </div>
-            {move || {
-                popover
-                    .get()
-                    .map(|p| {
-                        view! { <StackPopoverBox session=session popover=popover info=p /> }
-                    })
-            }}
         </section>
     }
 }
 
-/// Estimated popover footprint (px) used to clamp its top-left so it never
-/// spills past the viewport edges. Generous so a tall stack's box still fits.
+/// Nominal popover width (px), matching the CSS `width` so the first-frame
+/// clamp (before we can measure) is close; the post-mount effect re-clamps
+/// against the real rendered box.
 const POPOVER_W: f64 = 220.0;
+/// Generous height estimate (px) for the first-frame clamp only. Overwritten by
+/// the measured height once the box is in the DOM.
 const POPOVER_EST_H: f64 = 320.0;
 /// Gap (px) between the clicked badge and the popover's nominal corner.
 const POPOVER_GAP: f64 = 12.0;
 /// Keep this much margin from the viewport edge when clamping.
 const POPOVER_MARGIN: f64 = 8.0;
+
+/// Current viewport (innerWidth, innerHeight) in CSS px, with sane fallbacks.
+fn viewport_size() -> (f64, f64) {
+    let win = window();
+    let vw = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(360.0);
+    let vh = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(640.0);
+    (vw, vh)
+}
 
 /// Clamp a desired top-left so a `w`x`h` box stays within `[margin, extent-margin]`.
 /// Pure so the viewport-clamp math is unit-tested without a DOM.
@@ -410,22 +427,35 @@ fn StackPopoverBox(
     let layers = move || stack_layers(session.get().state(), info.coord);
     let count = move || layers().len();
 
-    // Anchor to the right of / below the badge, then clamp to the viewport so
-    // small / mobile screens never push the box off-screen.
-    let style = move || {
-        let win = window();
-        let vw = win
-            .inner_width()
-            .ok()
-            .and_then(|v| v.as_f64())
-            .unwrap_or(360.0);
-        let vh = win
-            .inner_height()
-            .ok()
-            .and_then(|v| v.as_f64())
-            .unwrap_or(640.0);
+    let pop_ref = create_node_ref::<leptos::html::Div>();
+    // The live top-left (px). Seeded with a first-frame clamp using the nominal
+    // size, then corrected once we can measure the real rendered box.
+    let pos = create_rw_signal({
+        let (vw, vh) = viewport_size();
         let left = clamp_popover(info.anchor_x + POPOVER_GAP, POPOVER_W, vw, POPOVER_MARGIN);
         let top = clamp_popover(info.anchor_y + POPOVER_GAP, POPOVER_EST_H, vh, POPOVER_MARGIN);
+        (left, top)
+    });
+
+    // After mount, the box has its content-driven width/height. Measure it and
+    // re-clamp against the real viewport so the right edge and bottom can never
+    // overflow regardless of stack height or title length. Runs once the node
+    // exists; the box is single-shot (a fresh popover remounts), so a single
+    // post-mount correction is sufficient.
+    create_effect(move |_| {
+        let Some(el) = pop_ref.get() else { return };
+        let el: &web_sys::Element = el.as_ref();
+        let rect = el.get_bounding_client_rect();
+        let (vw, vh) = viewport_size();
+        let w = rect.width().max(1.0);
+        let h = rect.height().max(1.0);
+        let left = clamp_popover(info.anchor_x + POPOVER_GAP, w, vw, POPOVER_MARGIN);
+        let top = clamp_popover(info.anchor_y + POPOVER_GAP, h, vh, POPOVER_MARGIN);
+        pos.set((left, top));
+    });
+
+    let style = move || {
+        let (left, top) = pos.get();
         format!("left:{left}px;top:{top}px;")
     };
 
@@ -441,6 +471,7 @@ fn StackPopoverBox(
     view! {
         <div class="stack-pop-backdrop" on:pointerdown=on_backdrop>
             <div
+                node_ref=pop_ref
                 class="stack-pop"
                 style=style
                 role="dialog"
