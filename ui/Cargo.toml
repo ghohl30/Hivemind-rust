@@ -5,6 +5,14 @@ edition = "2021"
 publish = false
 description = "Browser UI for the Hive engine (Leptos CSR -> WebAssembly)."
 
+[features]
+# `serde` gates the optional Serialize/Deserialize derives on the game-core
+# config types. Enabled by default so the worker message contract (which always
+# uses serde) and the config DTOs share one code path. The native test suite
+# exercises the serde paths under the default feature set.
+default = ["serde"]
+serde = []
+
 [dependencies]
 # Engine compiled into the same WASM bundle; serde feature enables Move/leaf-type
 # JSON for save/load and the eventual Web Worker search boundary.
