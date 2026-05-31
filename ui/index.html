@@ -7,10 +7,12 @@
     <link data-trunk rel="rust" data-wasm-opt="z" />
     <link data-trunk rel="copy-dir" href="assets" />
     <style>
+      /* Light theme; no color-scheme:dark so the chosen tile/glyph colors hold. */
       :root {
-        color-scheme: light dark;
         --bg: #f4f1ea;
         --fg: #1c1b18;
+        --panel: #ffffff;
+        --panel-border: #d9d2c2;
       }
       * { box-sizing: border-box; }
       html, body {
@@ -21,7 +23,7 @@
         font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
       }
       .app {
-        max-width: 960px;
+        max-width: 1200px;
         margin: 0 auto;
         padding: clamp(0.75rem, 2vw, 1.5rem);
         display: flex;
@@ -30,20 +32,111 @@
         min-height: 100%;
       }
       h1 { font-size: clamp(1.25rem, 4vw, 2rem); margin: 0; }
-      .board-placeholder {
-        flex: 1;
-        display: grid;
-        place-items: center;
-        border: 2px dashed currentColor;
-        border-radius: 12px;
-        opacity: 0.6;
-        min-height: 40vh;
-      }
+
+      /* Status bar: whose turn, turn number, placements, queen hint. */
       .status {
         display: flex;
         flex-wrap: wrap;
+        align-items: center;
         gap: 0.5rem 1.5rem;
+        padding: 0.6rem 0.9rem;
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 10px;
         font-variant-numeric: tabular-nums;
+      }
+      .status-hint {
+        color: #c0392b;
+        font-weight: 600;
+      }
+
+      /* Play area: hands flank the board on wide screens, stack on narrow. */
+      .play-area {
+        flex: 1;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1rem;
+        align-items: stretch;
+      }
+      .board {
+        flex: 1 1 320px;
+        min-width: 280px;
+        min-height: 50vh;
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 12px;
+        padding: 0.5rem;
+        display: flex;
+      }
+      .board-svg {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+
+      /* Hand panels. */
+      .hand {
+        flex: 1 1 200px;
+        min-width: 180px;
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 12px;
+        padding: 0.75rem;
+      }
+      .hand-title {
+        font-size: 1rem;
+        margin: 0 0 0.6rem;
+      }
+      .hand-grid {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
+      .hand-piece { line-height: 0; }
+      .hand-tile {
+        position: relative;
+        width: 56px;
+        height: 56px;
+        border: 1.5px solid;
+        border-radius: 10px;
+        display: grid;
+        place-items: center;
+      }
+      .hand-glyph {
+        width: 70%;
+        height: 70%;
+        object-fit: contain;
+      }
+      .hand-count {
+        position: absolute;
+        right: -4px;
+        bottom: -4px;
+        min-width: 18px;
+        height: 18px;
+        padding: 0 4px;
+        border-radius: 9px;
+        background: #c0392b;
+        color: #fff;
+        font-size: 11px;
+        line-height: 18px;
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .outcome {
+        padding: 0.75rem 1rem;
+        background: #1c1b18;
+        color: #f4f1ea;
+        border-radius: 10px;
+        font-weight: 700;
+        text-align: center;
+      }
+
+      /* On wide screens, lay hands + board out side by side and keep the board
+         the dominant column. On narrow screens flex-wrap stacks them. */
+      @media (min-width: 800px) {
+        .board { flex: 2 1 480px; }
+        .hand { flex: 0 0 220px; }
       }
     </style>
   </head>
