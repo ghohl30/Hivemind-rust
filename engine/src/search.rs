@@ -16,6 +16,22 @@
 //!   carves the AlphaZero-style learned evaluator out as a separate future
 //!   phase. The search machinery is the deliverable here; the eval can swap
 //!   later without touching anything in this file.
+//!
+//! ## TT mate-score encoding
+//!
+//! Mate scores are stored in the TT as "distance from root" (DFR), not
+//! "distance from the node where they were found". This matters for iterative
+//! deepening: a mate-in-3 found during depth-6 iteration should still read as
+//! mate-in-3 when probed during depth-4 iteration, regardless of what ply the
+//! probe happens at.
+//!
+//! Encoding (on store):
+//!   positive mate  → stored = score + ply   (shifts score up; root-relative)
+//!   negative mate  → stored = score - ply   (shifts score down)
+//!
+//! Decoding (on probe):
+//!   positive mate  → score  = stored - ply  (reverses the shift)
+//!   negative mate  → score  = stored + ply
 
 use crate::moves::Move;
 use crate::piece::{queen_of, Color, PieceSlot};
@@ -35,6 +51,9 @@ pub struct SearchStats {
     pub tt_cutoffs: u64,
     pub beta_cutoffs: u64,
     pub tt_stores: u64,
+    /// Deepest fully-completed iteration (always equals `max_depth` for a
+    /// non-iterative call, equals the last completed depth for an ID search).
+    pub depth: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,16 +115,37 @@ impl TranspositionTable {
     }
 }
 
-/// Top-level entry point. Runs negamax to `depth`, returns
-/// `(score, best_move, stats)` from the root side-to-move's perspective.
+/// Top-level entry point. Runs iterative deepening negamax up to `max_depth`,
+/// returns `(score, best_move, stats)` from the root side-to-move's
+/// perspective. `stats.depth` reports the deepest completed iteration.
+///
+/// The TT is **not** cleared between iterations: entries from shallower
+/// iterations provide move-ordering hints that prune the deeper search.
+/// Callers are responsible for clearing the TT between game moves if they
+/// want to avoid stale entries from a prior position (though the key-match
+/// guard makes false hits rare).
 pub fn search(
     state: &mut State,
-    depth: u8,
+    max_depth: u8,
     tt: &mut TranspositionTable,
 ) -> (i32, Option<Move>, SearchStats) {
     let mut stats = SearchStats::default();
-    let score = negamax(state, depth, 0, -MATE_SCORE, MATE_SCORE, tt, &mut stats);
-    // After search, the root entry should contain the best move.
+    let mut score = 0i32;
+
+    for d in 1..=max_depth {
+        score = negamax(state, d, 0, -MATE_SCORE, MATE_SCORE, tt, &mut stats);
+        stats.depth = d;
+
+        // If we found a forced mate, no deeper search can improve on it —
+        // cut the loop early. The mate distance is correct because the TT
+        // stores root-relative scores.
+        if score.abs() >= MATE_THRESHOLD {
+            break;
+        }
+    }
+
+    // After search, the root entry (written at max depth or mate depth)
+    // holds the best move found across all iterations.
     let best = tt.probe(state.zobrist()).and_then(|e| e.best_move);
     (score, best, stats)
 }
@@ -138,21 +178,24 @@ fn negamax(
     if let Some(entry) = tt.probe(key) {
         tt_move = entry.best_move;
         if entry.depth >= depth {
+            // Decode the stored score from root-relative to node-relative
+            // before using it for cutoffs or returning it.
+            let decoded = tt_decode_score(entry.score, ply);
             match entry.bound {
                 Bound::Exact => {
                     stats.tt_hits += 1;
                     stats.tt_cutoffs += 1;
-                    return entry.score;
+                    return decoded;
                 }
-                Bound::Lower if entry.score >= beta => {
+                Bound::Lower if decoded >= beta => {
                     stats.tt_hits += 1;
                     stats.tt_cutoffs += 1;
-                    return entry.score;
+                    return decoded;
                 }
-                Bound::Upper if entry.score <= alpha => {
+                Bound::Upper if decoded <= alpha => {
                     stats.tt_hits += 1;
                     stats.tt_cutoffs += 1;
-                    return entry.score;
+                    return decoded;
                 }
                 _ => {
                     stats.tt_hits += 1;
@@ -209,33 +252,50 @@ fn negamax(
     } else {
         Bound::Exact
     };
-    // Skip TT writes for mate scores — they're ply-relative and storing them
-    // unscaled would mislead probes from a different ply context. The simplest
-    // safe choice for this first-cut search.
-    if best_score.abs() < MATE_THRESHOLD {
-        tt.store(TtEntry {
-            key,
-            depth,
-            score: best_score,
-            bound,
-            best_move,
-        });
-        stats.tt_stores += 1;
-    } else if best_move.is_some() {
-        // Still record the best-move hint at this position so iterative
-        // searches can use it for ordering, but mark depth 0 so the
-        // mate-score isn't trusted for cutoffs.
-        tt.store(TtEntry {
-            key,
-            depth: 0,
-            score: 0,
-            bound: Bound::Exact,
-            best_move,
-        });
-        stats.tt_stores += 1;
-    }
+    // Encode the score as root-relative before storing so probes from any ply
+    // can reconstruct the correct node-relative value via tt_decode_score.
+    tt.store(TtEntry {
+        key,
+        depth,
+        score: tt_encode_score(best_score, ply),
+        bound,
+        best_move,
+    });
+    stats.tt_stores += 1;
 
     best_score
+}
+
+/// Encode a score for TT storage.
+///
+/// Mate scores are stored as "distance from root": a mate-in-3 found at
+/// ply 2 is stored as `MATE_SCORE - 3 + 2 = MATE_SCORE - 1`, not as
+/// `MATE_SCORE - 3`. When probed at a different ply, `tt_decode_score`
+/// reverses the shift so the caller always sees distance-from-current-node.
+#[inline(always)]
+fn tt_encode_score(score: i32, ply: u32) -> i32 {
+    let p = ply as i32;
+    if score >= MATE_THRESHOLD {
+        score + p
+    } else if score <= -MATE_THRESHOLD {
+        score - p
+    } else {
+        score
+    }
+}
+
+/// Decode a score retrieved from the TT back to node-relative (distance from
+/// the current node, not from the root).
+#[inline(always)]
+fn tt_decode_score(stored: i32, ply: u32) -> i32 {
+    let p = ply as i32;
+    if stored >= MATE_THRESHOLD {
+        stored - p
+    } else if stored <= -MATE_THRESHOLD {
+        stored + p
+    } else {
+        stored
+    }
 }
 
 fn terminal_score(outcome: Outcome, side_to_move: Color, ply: u32) -> i32 {
@@ -355,5 +415,83 @@ mod tests {
         // Black has 1 neighbour on its queen; white has 1 neighbour on its queen.
         // Eval should be 0 here (symmetric).
         assert_eq!(evaluate(&s), 0);
+    }
+
+    #[test]
+    fn tt_mate_score_encode_decode_roundtrip() {
+        // encode then decode must be identity for both polarities.
+        for ply in [0u32, 1, 3, 10] {
+            let pos_mate = MATE_SCORE - ply as i32 - 1;
+            let neg_mate = -(MATE_SCORE - ply as i32 - 1);
+            let heuristic = 42i32;
+
+            assert_eq!(tt_decode_score(tt_encode_score(pos_mate, ply), ply), pos_mate,
+                "positive mate roundtrip failed at ply {ply}");
+            assert_eq!(tt_decode_score(tt_encode_score(neg_mate, ply), ply), neg_mate,
+                "negative mate roundtrip failed at ply {ply}");
+            assert_eq!(tt_decode_score(tt_encode_score(heuristic, ply), ply), heuristic,
+                "heuristic roundtrip failed at ply {ply}");
+        }
+    }
+
+    #[test]
+    fn tt_mate_score_ply_independence() {
+        // A mate score encoded at ply=3, then decoded at ply=3, gives back the
+        // original. Encoded at ply=3 and decoded at ply=5 gives a *different*
+        // (smaller) mate distance, reflecting that we are 2 plies deeper in
+        // the tree when we probe.
+        let original = MATE_SCORE - 3; // "mate in 3 moves from current node"
+        let encoded = tt_encode_score(original, 3); // store as root-relative
+        // Probed from same ply → identical.
+        assert_eq!(tt_decode_score(encoded, 3), original);
+        // Probed 2 plies deeper → mate distance appears 2 smaller.
+        assert_eq!(tt_decode_score(encoded, 5), MATE_SCORE - 5);
+    }
+
+    #[test]
+    fn iterative_deepening_stats_depth_equals_max_depth() {
+        // The stats.depth field must report the deepest completed iteration.
+        let mut s = State::new();
+        let mut tt = TranspositionTable::with_capacity_log2(14);
+        let (_, _, stats) = search(&mut s, 3, &mut tt);
+        assert_eq!(stats.depth, 3, "stats.depth should equal max_depth when no forced mate");
+    }
+
+    #[test]
+    fn search_near_terminal_returns_non_pass_move() {
+        // Build a position with queens and ants on board (all moves legal) and
+        // run search at depth 4. This exercises the full iterative-deepening
+        // loop on a real midgame position and verifies:
+        //   1. The search completes without panicking.
+        //   2. A non-None, non-Pass move is returned.
+        //   3. State is left unmodified (balanced apply/unapply).
+        //
+        // Position: WQ + BQ + WA1 + BA1 — four pieces placed legally, queens
+        // on board so both sides can slide. The position is far from terminal
+        // but richly connected enough that depth-4 search exercises TT and
+        // move ordering thoroughly.
+        let mut s = State::new();
+        s.apply(Move::Place { piece: PieceId(0),  to: Coord::ORIGIN        }); // WQ
+        s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0)     }); // BQ
+        s.apply(Move::Place { piece: PieceId(8),  to: Coord::new(-1, 0)    }); // WA1
+        s.apply(Move::Place { piece: PieceId(19), to: Coord::new(2, 0)     }); // BA1
+
+        let undo_depth_before = s.undo_depth();
+        let mut tt = TranspositionTable::with_capacity_log2(16);
+        let (score, best_move, stats) = search(&mut s, 4, &mut tt);
+
+        let bm = best_move.expect("search at depth 4 must return a move");
+        assert!(
+            !matches!(bm, Move::Pass),
+            "search returned Pass in an open position (score={score}); \
+             legal_moves={:?}", s.legal_moves()
+        );
+        assert!(stats.nodes > 0);
+        assert_eq!(stats.depth, 4, "stats.depth must equal max_depth");
+        assert_eq!(
+            s.undo_depth(),
+            undo_depth_before,
+            "search left undo records on the stack"
+        );
     }
 }
