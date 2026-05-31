@@ -30,10 +30,12 @@
 // Internal modules — not part of the stable surface, subject to change.
 pub mod board;
 pub mod coord;
+pub mod game_runner;
 pub mod gen;
 pub mod moves;
 pub mod perft;
 pub mod piece;
+pub mod player;
 pub mod rules;
 pub mod search;
 pub mod state;
@@ -58,3 +60,7 @@ pub use state::{Outcome, State};
 
 // Search: entry point, result types, and the transposition table
 pub use search::{search, SearchStats, TranspositionTable, MATE_SCORE, MATE_THRESHOLD};
+
+// Phase 6: engine-vs-engine game runner
+pub use game_runner::{play_game, GameResult};
+pub use player::{FirstMovePlayer, Player, SearchPlayer};
