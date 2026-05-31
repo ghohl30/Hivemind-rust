@@ -1,8 +1,33 @@
-//! Hive game engine — base game only.
+//! # hive-engine — stable public API
 //!
-//! Phase 1: copy-make, on-demand cache recomputation, full rules + tests.
-//! See `/Users/gregor30/.claude/plans/hive-engine-project-eventual-charm.md`.
+//! **Everything re-exported from this file is the stable public API.** The UI
+//! crate (`hive-ui`) and any other consumer must depend only on items listed
+//! here. Everything else — module internals, `pub(crate)` items, types in
+//! `src/gen/`, `src/rules.rs`, `src/zobrist.rs`, etc. — is an implementation
+//! detail and may change between commits without notice.
+//!
+//! ## Stability contract
+//!
+//! - *Additive* changes (new methods, new re-exports, new optional feature
+//!   flags) are cheap and can happen any time.
+//! - *Breaking* changes (removing or renaming a re-exported item, changing a
+//!   method signature, adding a required `Move` variant) require explicit
+//!   coordination with the UI agent before landing.
+//! - **Adding a new `Move` variant is a breaking change.** The UI pattern-
+//!   matches on `Move`; an unexpected variant causes a compile error on the UI
+//!   side. Announce it and let the UI agent update its match arms first.
+//!
+//! ## Feature flags
+//!
+//! - `serde` — opt-in `Serialize`/`Deserialize` on all stable value types
+//!   (`Move`, `Coord`, `Direction`, `Color`, `PieceId`, `PieceType`,
+//!   `PieceSlot`, `StackTop`, `Outcome`). Not in the default feature set; the
+//!   UI crate opts in via
+//!   `hive-engine = { path = "../engine", features = ["serde"] }`.
+//!   `State` itself is intentionally not serialized — games persist as a
+//!   `Vec<Move>` replayed through `State::new()` + `apply`.
 
+// Internal modules — not part of the stable surface, subject to change.
 pub mod board;
 pub mod coord;
 pub mod gen;
@@ -14,8 +39,22 @@ pub mod search;
 pub mod state;
 pub mod zobrist;
 
+// ── Stable re-exports ────────────────────────────────────────────────────────
+
+// Board
 pub use board::Board;
+
+// Coordinates
 pub use coord::{Coord, Direction};
+
+// Moves
 pub use moves::Move;
+
+// Pieces and slots
 pub use piece::{Color, PieceId, PieceSlot, PieceType, StackTop};
+
+// Game state and outcome
 pub use state::{Outcome, State};
+
+// Search: entry point, result types, and the transposition table
+pub use search::{search, SearchStats, TranspositionTable, MATE_SCORE, MATE_THRESHOLD};
