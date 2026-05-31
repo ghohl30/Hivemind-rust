@@ -21,9 +21,16 @@ hive-engine = { path = "../engine", features = ["serde"] }
 # Leptos client-side rendering. `csr` selects the browser-only build (no SSR).
 leptos = { version = "0.6", features = ["csr"] }
 
-# WASM <-> JS glue and browser API bindings.
+# WASM <-> JS glue and browser API bindings. Explicit web-sys features for the
+# board's zoom/pan view controls: wheel + pointer events and the element-rect /
+# pointer-capture APIs they read.
 wasm-bindgen = "0.2"
-web-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Element",
+    "DomRect",
+    "WheelEvent",
+    "PointerEvent",
+] }
 
 # Serialization for DTOs / persisted move lists.
 serde = { version = "1", features = ["derive"] }

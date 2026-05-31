@@ -38,29 +38,31 @@ pub fn type_label(t: PieceType) -> &'static str {
     }
 }
 
-/// Tile fill color for a player's pieces (light theme).
+/// Tile fill color for a player's pieces. Parchment-skin tones: warm ivory for
+/// White, dark roasted brown for Black.
 pub fn tile_fill(c: Color) -> &'static str {
     match c {
-        Color::White => "#f7f4ec",
-        Color::Black => "#2b2b2b",
+        Color::White => "#f2e8d0",
+        Color::Black => "#463a31",
     }
 }
 
 /// Tile border/stroke color for a player's pieces.
 pub fn tile_stroke(c: Color) -> &'static str {
     match c {
-        Color::White => "#b9b09a",
-        Color::Black => "#101010",
+        Color::White => "#c2ab83",
+        Color::Black => "#2b231c",
     }
 }
 
 /// Glyph color for a piece on a player-colored tile. The glyph SVGs are
-/// `currentColor` silhouettes, so this drives the CSS `color:` of the wrapper.
-/// Dark glyph on the light (white) tile, light glyph on the dark (black) tile.
+/// `currentColor` silhouettes, so this drives the recolor fill. Dark ink on the
+/// light (white) tile, warm parchment on the dark (black) tile so both stay
+/// legible against the new tile tones.
 pub fn glyph_color(c: Color) -> &'static str {
     match c {
-        Color::White => "#1c1b18",
-        Color::Black => "#f2efe6",
+        Color::White => "#20170f",
+        Color::Black => "#f2e8d0",
     }
 }
 
