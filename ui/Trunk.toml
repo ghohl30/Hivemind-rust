@@ -1,0 +1,10 @@
+# Trunk build config for the Hive UI (Leptos CSR -> WASM).
+# Run `trunk serve` for a dev server, `trunk build --release` for a dist bundle.
+
+[build]
+target = "index.html"
+dist = "dist"
+
+[serve]
+port = 8080
+open = false
