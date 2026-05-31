@@ -1,4 +1,4 @@
-//! Leptos components for the playable Hive board (hot-seat).
+//! Leptos components for the playable Hive board (hot-seat or vs AI).
 //!
 //! The single source of truth is a [`Session`] held in a reactive signal; the
 //! board, hands, and status panel all *derive* from the session's current
@@ -7,16 +7,22 @@
 //! selection are highlighted gold and clicking one applies the corresponding
 //! `Move` through the session (which validates it).
 //!
+//! When a [`GameSetup`] is active, AI moves are triggered automatically via
+//! `spawn_local` after every human move; a 50 ms yield lets the "Thinking…"
+//! indicator render before the synchronous engine search runs.
+//!
 //! Structure:
-//!   `App`         — owns the `session` and `selection` signals; the shell.
+//!   `App`         — owns the session, selection, game-setup, and ai-thinking
+//!                   signals; renders a setup screen or the game board.
 //!   `Board`       — reactive SVG; click-to-select / click-to-move plus the
-//!                   PR-7 zoom / pan / fit controls. Discriminates click vs drag.
+//!                   zoom / pan / fit controls. Gated by `ai_thinking` so
+//!                   clicks are ignored while the engine is searching.
 //!   `HexTile`     — one hex; carries `legal` / `selected` classes and, when
 //!                   interactive, a click handler that routes through the board.
 //!   `FrontierCell`— faint empty-cell outline (also a click target so clicking
 //!                   an empty legal landing spot applies the move).
 //!   `StatusPanel` — whose turn, turn number, placements, queen hint, outcome,
-//!                   plus the forced-`Pass` affordance.
+//!                   forced-`Pass` affordance, "Thinking…" indicator, "New Game".
 //!   `HandPanel`   — one color's in-hand pieces; the side-to-move's chips are
 //!                   clickable and show a selected state.
 //!
@@ -26,17 +32,22 @@
 
 use std::collections::BTreeSet;
 
+use gloo_timers::future::TimeoutFuture;
 use hive_engine::{Color, Coord, Move, Outcome, PieceId};
 use leptos::*;
+use wasm_bindgen_futures::spawn_local;
 use web_sys::{PointerEvent, WheelEvent};
 
-use crate::game::{LegalMoveIndex, Session};
+use crate::game::{compute_ai_move, GameSetup, LegalMoveIndex, Session};
 use crate::render::demo::demo_session;
 use crate::render::hex::{
     axial_to_pixel, client_to_user, fit_viewbox, frontier_coords, hex_polygon_points,
     pan_by_pixels, pixel_to_axial, zoom_about, Point, ViewBox,
 };
-use crate::render::interaction::{board_click, hand_click, highlight_destinations, BoardClick, Selection};
+use crate::render::interaction::{
+    board_click, hand_click, highlight_destinations, BoardClick, Selection,
+};
+use crate::render::setup::SetupScreen;
 use crate::render::view::{
     board_tiles, color_label, glyph_color, glyph_url, hand_entries, occupied_coords,
     queen_must_be_placed, stack_layers, tile_fill, tile_stroke, type_label, HandEntry, TileView,
@@ -63,8 +74,14 @@ const CLICK_SLOP_PX: f64 = 5.0;
 const START_FROM_DEMO: bool = false;
 
 /// Root component: owns the live session + selection signals and the shell.
+/// Renders the setup screen until the player starts a game, then the board.
 #[component]
 pub fn App() -> impl IntoView {
+    // `None` = show setup screen; `Some(setup)` = game in progress.
+    let game_setup = create_rw_signal::<Option<GameSetup>>(None);
+    // Blocks player interaction while the engine search task is running.
+    let ai_thinking = create_rw_signal(false);
+
     let initial = if START_FROM_DEMO {
         demo_session()
     } else {
@@ -77,51 +94,86 @@ pub fn App() -> impl IntoView {
     // the floating box can be placed near it and clamped to the viewport.
     let popover = create_rw_signal::<Option<StackPopover>>(None);
 
-    // Whenever the position changes, a stale selection (a piece that is no
-    // longer the side-to-move's, or no longer placeable/movable) is dropped by
-    // the board's reactive highlight derivation; we also clear it on every
-    // applied move explicitly in the click handler.
+    // Called by SetupScreen when the player clicks "Start Game".
+    let on_start = Callback::new(move |setup: GameSetup| {
+        session.set(Session::new());
+        selection.set(None);
+        popover.set(None);
+        ai_thinking.set(false);
+        game_setup.set(Some(setup));
+        // If AI plays White it moves first; kick it off immediately.
+        if setup.ai_moves_first() {
+            maybe_trigger_ai(session, setup, ai_thinking);
+        }
+    });
 
-    let white_hand = move || hand_entries(session.get().state(), Color::White);
-    let black_hand = move || hand_entries(session.get().state(), Color::Black);
+    // "New Game" button returns to the setup screen and resets state.
+    let on_new_game = Callback::new(move |_: ()| {
+        game_setup.set(None);
+        session.set(Session::new());
+        selection.set(None);
+        ai_thinking.set(false);
+    });
 
     view! {
         <main class="app">
             <h1>"Hive"</h1>
-            <StatusPanel session=session selection=selection />
-            <div class="play-area">
-                <HandPanel
-                    color=Color::White
-                    entries=Signal::derive(white_hand)
-                    session=session
-                    selection=selection
-                />
-                <Board session=session selection=selection popover=popover />
-                <HandPanel
-                    color=Color::Black
-                    entries=Signal::derive(black_hand)
-                    session=session
-                    selection=selection
-                />
-            </div>
-            {move || {
-                session
-                    .get()
-                    .outcome()
-                    .map(|o| view! { <OutcomeBanner outcome=o /> })
-            }}
-            // The stack inspector is rendered here at the App root, as a sibling
-            // of the panels, NOT inside the board panel. The board panel has
-            // `backdrop-filter` + `overflow: hidden`, which would establish a
-            // containing block for `position: fixed` descendants and clip them;
-            // mounting the popover at the root lets `fixed` resolve against the
-            // viewport so viewport-clamping actually keeps the whole box visible.
-            {move || {
-                popover
-                    .get()
-                    .map(|p| {
-                        view! { <StackPopoverBox session=session popover=popover info=p /> }
-                    })
+            {move || match game_setup.get() {
+                None => view! { <SetupScreen on_start=on_start /> }.into_view(),
+                Some(setup) => {
+                    let white_hand = move || hand_entries(session.get().state(), Color::White);
+                    let black_hand = move || hand_entries(session.get().state(), Color::Black);
+                    view! {
+                        <StatusPanel
+                            session=session
+                            selection=selection
+                            ai_thinking=ai_thinking
+                            setup=setup
+                            on_new_game=on_new_game
+                        />
+                        <div class="play-area">
+                            <HandPanel
+                                color=Color::White
+                                entries=Signal::derive(white_hand)
+                                session=session
+                                selection=selection
+                            />
+                            <Board
+                                session=session
+                                selection=selection
+                                popover=popover
+                                ai_thinking=ai_thinking
+                                setup=setup
+                            />
+                            <HandPanel
+                                color=Color::Black
+                                entries=Signal::derive(black_hand)
+                                session=session
+                                selection=selection
+                            />
+                        </div>
+                        {move || {
+                            session
+                                .get()
+                                .outcome()
+                                .map(|o| view! { <OutcomeBanner outcome=o /> })
+                        }}
+                        // The stack inspector is rendered here at the App root, as a
+                        // sibling of the panels, NOT inside the board panel. The board
+                        // panel has `backdrop-filter` + `overflow: hidden`, which would
+                        // establish a containing block for `position: fixed` descendants
+                        // and clip them; mounting the popover at the root lets `fixed`
+                        // resolve against the viewport so viewport-clamping works.
+                        {move || {
+                            popover
+                                .get()
+                                .map(|p| {
+                                    view! { <StackPopoverBox session=session popover=popover info=p /> }
+                                })
+                        }}
+                    }
+                    .into_view()
+                }
             }}
         </main>
     }
@@ -149,12 +201,15 @@ fn default_viewbox(session: &Session) -> ViewBox {
 
 /// The board SVG. Reactive over `session`; selection-aware highlighting; pan /
 /// zoom / fit; click-vs-drag discrimination so a small drag pans without
-/// selecting and a click selects without panning.
+/// selecting and a click selects without panning. Clicks are ignored while
+/// `ai_thinking` is true.
 #[component]
 fn Board(
     session: RwSignal<Session>,
     selection: RwSignal<Option<Selection>>,
     popover: RwSignal<Option<StackPopover>>,
+    ai_thinking: RwSignal<bool>,
+    setup: GameSetup,
 ) -> impl IntoView {
     // Derived, reactive view-models. These re-run whenever the session changes.
     let tiles = move || board_tiles(session.get().state());
@@ -293,6 +348,10 @@ fn Board(
         if was_drag || origin.is_none() {
             return;
         }
+        // Don't resolve clicks while the engine is searching.
+        if ai_thinking.get_untracked() {
+            return;
+        }
         let (left, top, w, h) = svg_size();
         let px = ev.client_x() as f64 - left;
         let py = ev.client_y() as f64 - top;
@@ -304,7 +363,7 @@ fn Board(
         if popover.get_untracked().is_some() {
             popover.set(None);
         }
-        handle_board_click(session, selection, clicked);
+        handle_board_click(session, selection, clicked, setup, ai_thinking);
     };
 
     // --- Buttons ---
@@ -559,6 +618,53 @@ fn StackPopoverBox(
     }
 }
 
+/// Trigger an AI search if it's the AI's turn and the game is not over.
+/// No-op if already thinking or game has ended. Safe to call speculatively.
+fn maybe_trigger_ai(
+    session: RwSignal<Session>,
+    setup: GameSetup,
+    ai_thinking: RwSignal<bool>,
+) {
+    let s = session.get_untracked();
+    if s.is_over() || ai_thinking.get_untracked() {
+        return;
+    }
+    if s.state().side_to_move() == setup.ai {
+        ai_thinking.set(true);
+        let moves = s.moves().to_vec();
+        let depth = setup.ai_depth();
+        spawn_local(async move {
+            // Yield to the browser event loop so "Thinking…" renders before
+            // the synchronous search blocks the WASM thread.
+            TimeoutFuture::new(50).await;
+            if let Some(m) = compute_ai_move(&moves, depth) {
+                session.update(|s| {
+                    let _ = s.push_move(m);
+                });
+            }
+            ai_thinking.set(false);
+            // Edge case: if the human has no moves (forced pass), the AI must
+            // move again after the human passes — check and recurse once more.
+            let s2 = session.get_untracked();
+            if !s2.is_over() && s2.state().side_to_move() == setup.ai {
+                maybe_trigger_ai(session, setup, ai_thinking);
+            }
+        });
+    }
+}
+
+/// Apply a move and, if a game setup is active, trigger the AI response.
+fn apply_move_and_trigger_ai(
+    session: RwSignal<Session>,
+    selection: RwSignal<Option<Selection>>,
+    m: Move,
+    setup: GameSetup,
+    ai_thinking: RwSignal<bool>,
+) {
+    apply_move(session, selection, m);
+    maybe_trigger_ai(session, setup, ai_thinking);
+}
+
 /// Apply a resolved board click to the signals: select / clear / apply-move.
 /// Centralized so the pointer-up handler stays thin. `clicked` is the axial
 /// coord under the pointer.
@@ -566,6 +672,8 @@ fn handle_board_click(
     session: RwSignal<Session>,
     selection: RwSignal<Option<Selection>>,
     clicked: Coord,
+    setup: GameSetup,
+    ai_thinking: RwSignal<bool>,
 ) {
     // Don't accept moves once the game is over.
     if session.with(|s| s.is_over()) {
@@ -582,7 +690,7 @@ fn handle_board_click(
     let _ = side;
     match decision {
         BoardClick::Apply(m) => {
-            apply_move(session, selection, m);
+            apply_move_and_trigger_ai(session, selection, m, setup, ai_thinking);
         }
         BoardClick::Select(next) => {
             selection.set(next);
@@ -756,12 +864,15 @@ fn HexTile(
     }
 }
 
-/// Whose turn, turn number, placements, the queen hint, and the forced-`Pass`
-/// affordance. All reactive over the session.
+/// Whose turn, turn number, placements, the queen hint, the forced-`Pass`
+/// affordance, a "Thinking…" indicator while the AI searches, and "New Game".
 #[component]
 fn StatusPanel(
     session: RwSignal<Session>,
     selection: RwSignal<Option<Selection>>,
+    ai_thinking: RwSignal<bool>,
+    setup: GameSetup,
+    on_new_game: Callback<()>,
 ) -> impl IntoView {
     let side = move || session.get().state().side_to_move();
     let side_text = move || color_label(side());
@@ -770,14 +881,18 @@ fn StatusPanel(
     let show_queen_hint = move || queen_must_be_placed(session.get().state(), side());
     let is_over = move || session.get().is_over();
 
-    // Forced pass: the only legal move is `Pass`. Surface a button rather than
-    // auto-passing, so the player sees the situation explicitly.
+    // Forced pass: only shown on the human's turn (AI handles its own forced
+    // pass internally) and not while the AI is thinking.
     let forced_pass = move || {
-        !is_over() && LegalMoveIndex::from_state(session.get().state()).is_forced_pass()
+        !is_over()
+            && !ai_thinking.get()
+            && session.get().state().side_to_move() == setup.human
+            && LegalMoveIndex::from_state(session.get().state()).is_forced_pass()
     };
     let on_pass = move |_| {
-        apply_move(session, selection, Move::Pass);
+        apply_move_and_trigger_ai(session, selection, Move::Pass, setup, ai_thinking);
     };
+    let new_game = move |_| on_new_game.call(());
 
     view! {
         <section class="status" aria-label="game status">
@@ -814,6 +929,12 @@ fn StatusPanel(
                         }
                     })
             }}
+            {move || {
+                ai_thinking.get().then(|| {
+                    view! { <span class="status-hint thinking">"Thinking\u{2026}"</span> }
+                })
+            }}
+            <button class="ctrl-btn" on:click=new_game>"New Game"</button>
         </section>
     }
 }

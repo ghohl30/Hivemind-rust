@@ -11,11 +11,13 @@
 //!   - [`config`]   — new-game configuration (human color, AI difficulty/depth).
 //!   - [`worker`]   — serde message contract for the future search Web Worker.
 
+pub mod ai;
 pub mod config;
 pub mod index;
 pub mod session;
 pub mod worker;
 
+pub use ai::compute_ai_move;
 pub use config::{Difficulty, GameSetup, HumanColor, NewGameConfig};
 pub use index::LegalMoveIndex;
 pub use session::{replay, IllegalMove, Session};

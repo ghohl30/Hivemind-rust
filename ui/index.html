@@ -395,6 +395,76 @@
         .board { flex: 2 1 480px; }
         .hand { flex: 0 0 220px; }
       }
+
+      /* New-game setup screen */
+      .setup {
+        display: flex;
+        flex-direction: column;
+        gap: 1.5rem;
+        align-items: center;
+        padding: 2rem 1rem;
+        max-width: 480px;
+        margin: 0 auto;
+      }
+      .setup-title {
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: clamp(1.2rem, 3vw, 1.8rem);
+        font-weight: 700;
+        margin: 0;
+      }
+      .setup-row {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.5rem;
+        width: 100%;
+      }
+      .setup-opts {
+        display: flex;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      .opt-btn {
+        padding: 0.45rem 1.1rem;
+        border: 1.5px solid var(--panel-border);
+        border-radius: 999px;
+        background: rgba(255, 248, 236, 0.92);
+        color: var(--ink);
+        font-size: 0.95rem;
+        cursor: pointer;
+        transition: background 140ms ease, border-color 140ms ease;
+      }
+      .opt-btn:hover { background: #fff; }
+      .opt-btn.active {
+        background: var(--accent);
+        color: #f6efe3;
+        border-color: var(--accent);
+        font-weight: 700;
+      }
+      .start-btn {
+        padding: 0.7rem 2rem;
+        border: none;
+        border-radius: 999px;
+        background: var(--accent);
+        color: #f6efe3;
+        font-size: 1.05rem;
+        font-weight: 700;
+        cursor: pointer;
+        box-shadow: 0 6px 18px -8px rgba(181, 93, 36, 0.7);
+        transition: transform 120ms ease;
+      }
+      .start-btn:hover { transform: translateY(-2px); }
+      .start-btn:active { transform: none; }
+
+      /* AI thinking indicator */
+      .thinking {
+        animation: pulse 1.2s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.45; }
+      }
     </style>
   </head>
   <body></body>

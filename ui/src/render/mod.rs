@@ -12,6 +12,7 @@
 pub mod demo;
 pub mod hex;
 pub mod interaction;
+pub mod setup;
 pub mod view;
 
 pub mod components;
