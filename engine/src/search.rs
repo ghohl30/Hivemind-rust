@@ -16,6 +16,22 @@
 //!   carves the AlphaZero-style learned evaluator out as a separate future
 //!   phase. The search machinery is the deliverable here; the eval can swap
 //!   later without touching anything in this file.
+//!
+//! ## TT mate-score encoding
+//!
+//! Mate scores are stored in the TT as "distance from root" (DFR), not
+//! "distance from the node where they were found". This matters for iterative
+//! deepening: a mate-in-3 found during depth-6 iteration should still read as
+//! mate-in-3 when probed during depth-4 iteration, regardless of what ply the
+//! probe happens at.
+//!
+//! Encoding (on store):
+//!   positive mate  → stored = score + ply   (shifts score up; root-relative)
+//!   negative mate  → stored = score - ply   (shifts score down)
+//!
+//! Decoding (on probe):
+//!   positive mate  → score  = stored - ply  (reverses the shift)
+//!   negative mate  → score  = stored + ply
 
 use crate::moves::Move;
 use crate::piece::{queen_of, Color, PieceSlot};
@@ -138,21 +154,24 @@ fn negamax(
     if let Some(entry) = tt.probe(key) {
         tt_move = entry.best_move;
         if entry.depth >= depth {
+            // Decode the stored score from root-relative to node-relative
+            // before using it for cutoffs or returning it.
+            let decoded = tt_decode_score(entry.score, ply);
             match entry.bound {
                 Bound::Exact => {
                     stats.tt_hits += 1;
                     stats.tt_cutoffs += 1;
-                    return entry.score;
+                    return decoded;
                 }
-                Bound::Lower if entry.score >= beta => {
+                Bound::Lower if decoded >= beta => {
                     stats.tt_hits += 1;
                     stats.tt_cutoffs += 1;
-                    return entry.score;
+                    return decoded;
                 }
-                Bound::Upper if entry.score <= alpha => {
+                Bound::Upper if decoded <= alpha => {
                     stats.tt_hits += 1;
                     stats.tt_cutoffs += 1;
-                    return entry.score;
+                    return decoded;
                 }
                 _ => {
                     stats.tt_hits += 1;
@@ -209,33 +228,50 @@ fn negamax(
     } else {
         Bound::Exact
     };
-    // Skip TT writes for mate scores — they're ply-relative and storing them
-    // unscaled would mislead probes from a different ply context. The simplest
-    // safe choice for this first-cut search.
-    if best_score.abs() < MATE_THRESHOLD {
-        tt.store(TtEntry {
-            key,
-            depth,
-            score: best_score,
-            bound,
-            best_move,
-        });
-        stats.tt_stores += 1;
-    } else if best_move.is_some() {
-        // Still record the best-move hint at this position so iterative
-        // searches can use it for ordering, but mark depth 0 so the
-        // mate-score isn't trusted for cutoffs.
-        tt.store(TtEntry {
-            key,
-            depth: 0,
-            score: 0,
-            bound: Bound::Exact,
-            best_move,
-        });
-        stats.tt_stores += 1;
-    }
+    // Encode the score as root-relative before storing so probes from any ply
+    // can reconstruct the correct node-relative value via tt_decode_score.
+    tt.store(TtEntry {
+        key,
+        depth,
+        score: tt_encode_score(best_score, ply),
+        bound,
+        best_move,
+    });
+    stats.tt_stores += 1;
 
     best_score
+}
+
+/// Encode a score for TT storage.
+///
+/// Mate scores are stored as "distance from root": a mate-in-3 found at
+/// ply 2 is stored as `MATE_SCORE - 3 + 2 = MATE_SCORE - 1`, not as
+/// `MATE_SCORE - 3`. When probed at a different ply, `tt_decode_score`
+/// reverses the shift so the caller always sees distance-from-current-node.
+#[inline(always)]
+fn tt_encode_score(score: i32, ply: u32) -> i32 {
+    let p = ply as i32;
+    if score >= MATE_THRESHOLD {
+        score + p
+    } else if score <= -MATE_THRESHOLD {
+        score - p
+    } else {
+        score
+    }
+}
+
+/// Decode a score retrieved from the TT back to node-relative (distance from
+/// the current node, not from the root).
+#[inline(always)]
+fn tt_decode_score(stored: i32, ply: u32) -> i32 {
+    let p = ply as i32;
+    if stored >= MATE_THRESHOLD {
+        stored - p
+    } else if stored <= -MATE_THRESHOLD {
+        stored + p
+    } else {
+        stored
+    }
 }
 
 fn terminal_score(outcome: Outcome, side_to_move: Color, ply: u32) -> i32 {
@@ -355,5 +391,36 @@ mod tests {
         // Black has 1 neighbour on its queen; white has 1 neighbour on its queen.
         // Eval should be 0 here (symmetric).
         assert_eq!(evaluate(&s), 0);
+    }
+
+    #[test]
+    fn tt_mate_score_encode_decode_roundtrip() {
+        // encode then decode must be identity for both polarities.
+        for ply in [0u32, 1, 3, 10] {
+            let pos_mate = MATE_SCORE - ply as i32 - 1;
+            let neg_mate = -(MATE_SCORE - ply as i32 - 1);
+            let heuristic = 42i32;
+
+            assert_eq!(tt_decode_score(tt_encode_score(pos_mate, ply), ply), pos_mate,
+                "positive mate roundtrip failed at ply {ply}");
+            assert_eq!(tt_decode_score(tt_encode_score(neg_mate, ply), ply), neg_mate,
+                "negative mate roundtrip failed at ply {ply}");
+            assert_eq!(tt_decode_score(tt_encode_score(heuristic, ply), ply), heuristic,
+                "heuristic roundtrip failed at ply {ply}");
+        }
+    }
+
+    #[test]
+    fn tt_mate_score_ply_independence() {
+        // A mate score encoded at ply=3, then decoded at ply=3, gives back the
+        // original. Encoded at ply=3 and decoded at ply=5 gives a *different*
+        // (smaller) mate distance, reflecting that we are 2 plies deeper in
+        // the tree when we probe.
+        let original = MATE_SCORE - 3; // "mate in 3 moves from current node"
+        let encoded = tt_encode_score(original, 3); // store as root-relative
+        // Probed from same ply → identical.
+        assert_eq!(tt_decode_score(encoded, 3), original);
+        // Probed 2 plies deeper → mate distance appears 2 smaller.
+        assert_eq!(tt_decode_score(encoded, 5), MATE_SCORE - 5);
     }
 }
