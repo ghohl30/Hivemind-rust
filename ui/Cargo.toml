@@ -39,3 +39,10 @@ serde_json = "1"
 
 # Surface Rust panics in the browser console instead of an opaque "unreachable".
 console_error_panic_hook = "0.1"
+
+# Async task executor for WASM (spawn_local) and browser timer futures.
+wasm-bindgen-futures = "0.4"
+gloo-timers = { version = "0.2", features = ["futures"] }
+
+# JS interop for Math.random() coin flip in the setup screen.
+js-sys = "0.3"
