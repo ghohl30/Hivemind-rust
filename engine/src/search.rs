@@ -34,7 +34,7 @@
 //!   negative mate  → score  = stored + ply
 
 use crate::moves::Move;
-use crate::piece::{queen_of, Color, PieceSlot};
+use crate::piece::{queen_of, Color, PieceSlot, PieceType};
 use crate::state::{Outcome, State};
 use smallvec::SmallVec;
 
@@ -205,23 +205,70 @@ fn negamax(
     }
 
     let moves = state.legal_moves();
-    // Move ordering: try the TT move first if it's still legal. Cheap,
-    // significant cutoffs gain.
-    let mut ordered: SmallVec<[Move; 64]> = SmallVec::with_capacity(moves.len());
-    if let Some(tm) = tt_move {
-        if let Some(pos) = moves.iter().position(|m| *m == tm) {
-            ordered.push(tm);
-            for (i, m) in moves.iter().enumerate() {
-                if i != pos {
-                    ordered.push(*m);
-                }
-            }
-        } else {
-            ordered.extend_from_slice(&moves);
+    // Move ordering pass 1: TT move first (if still legal).
+    // Move ordering pass 2: ant Slide moves tiered by proximity to opponent queen.
+    //   Tier 1 — `to` adjacent to opponent queen (on board).
+    //   Tier 2 — `to` adjacent to any opponent piece.
+    //   Tier 3 — ant moves not adjacent to any opponent piece.
+    // Final order: [TT move] [tier-1 ant slides] [tier-2 ant slides]
+    //              [non-ant non-TT moves in gen order] [tier-3 ant slides]
+    //
+    // This is a reorder only — every legal move is searched.
+
+    // Determine the opponent's queen coord for tier-1 classification.
+    let opp = state.side_to_move().other();
+    let opp_queen_coord = match state.piece_slot(queen_of(opp)) {
+        PieceSlot::OnBoard { coord, .. } => Some(coord),
+        _ => None,
+    };
+
+    // Classify each non-TT move.
+    let mut tier1: SmallVec<[Move; 8]> = SmallVec::new();
+    let mut tier2: SmallVec<[Move; 8]> = SmallVec::new();
+    let mut non_ant: SmallVec<[Move; 32]> = SmallVec::new();
+    let mut tier3: SmallVec<[Move; 8]> = SmallVec::new();
+
+    let tt_pos = tt_move.and_then(|tm| moves.iter().position(|m| *m == tm));
+
+    for (i, &m) in moves.iter().enumerate() {
+        // Skip the TT move — it goes first unconditionally.
+        if tt_pos == Some(i) {
+            continue;
         }
-    } else {
-        ordered.extend_from_slice(&moves);
+        if let Move::Slide { piece, to } = m {
+            if piece.piece_type() == PieceType::SoldierAnt {
+                // Check tier 1: `to` adjacent to opponent queen.
+                if let Some(qc) = opp_queen_coord {
+                    if qc.neighbours().contains(&to) {
+                        tier1.push(m);
+                        continue;
+                    }
+                }
+                // Check tier 2: `to` adjacent to any opponent piece (board top).
+                let board = state.board();
+                let adj_opp = to.neighbours().iter().any(|&nbr| {
+                    board.top_at(nbr).map_or(false, |top| top.piece.color() == opp)
+                });
+                if adj_opp {
+                    tier2.push(m);
+                } else {
+                    tier3.push(m);
+                }
+                continue;
+            }
+        }
+        non_ant.push(m);
     }
+
+    // Assemble final ordering.
+    let mut ordered: SmallVec<[Move; 64]> = SmallVec::with_capacity(moves.len());
+    if let Some(pos) = tt_pos {
+        ordered.push(moves[pos]);
+    }
+    ordered.extend_from_slice(&tier1);
+    ordered.extend_from_slice(&tier2);
+    ordered.extend_from_slice(&non_ant);
+    ordered.extend_from_slice(&tier3);
 
     let mut best_score = -MATE_SCORE - 1;
     let mut best_move: Option<Move> = None;
@@ -436,21 +483,14 @@ mod tests {
 
     #[test]
     fn tt_mate_score_ply_independence() {
-        // A mate score encoded at ply=3, then decoded at ply=3, gives back the
-        // original. Encoded at ply=3 and decoded at ply=5 gives a *different*
-        // (smaller) mate distance, reflecting that we are 2 plies deeper in
-        // the tree when we probe.
-        let original = MATE_SCORE - 3; // "mate in 3 moves from current node"
-        let encoded = tt_encode_score(original, 3); // store as root-relative
-        // Probed from same ply → identical.
+        let original = MATE_SCORE - 3;
+        let encoded = tt_encode_score(original, 3);
         assert_eq!(tt_decode_score(encoded, 3), original);
-        // Probed 2 plies deeper → mate distance appears 2 smaller.
         assert_eq!(tt_decode_score(encoded, 5), MATE_SCORE - 5);
     }
 
     #[test]
     fn iterative_deepening_stats_depth_equals_max_depth() {
-        // The stats.depth field must report the deepest completed iteration.
         let mut s = State::new();
         let mut tt = TranspositionTable::with_capacity_log2(14);
         let (_, _, stats) = search(&mut s, 3, &mut tt);
@@ -459,17 +499,6 @@ mod tests {
 
     #[test]
     fn search_near_terminal_returns_non_pass_move() {
-        // Build a position with queens and ants on board (all moves legal) and
-        // run search at depth 4. This exercises the full iterative-deepening
-        // loop on a real midgame position and verifies:
-        //   1. The search completes without panicking.
-        //   2. A non-None, non-Pass move is returned.
-        //   3. State is left unmodified (balanced apply/unapply).
-        //
-        // Position: WQ + BQ + WA1 + BA1 — four pieces placed legally, queens
-        // on board so both sides can slide. The position is far from terminal
-        // but richly connected enough that depth-4 search exercises TT and
-        // move ordering thoroughly.
         let mut s = State::new();
         s.apply(Move::Place { piece: PieceId(0),  to: Coord::ORIGIN        }); // WQ
         s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0)     }); // BQ
@@ -488,10 +517,22 @@ mod tests {
         );
         assert!(stats.nodes > 0);
         assert_eq!(stats.depth, 4, "stats.depth must equal max_depth");
-        assert_eq!(
-            s.undo_depth(),
-            undo_depth_before,
-            "search left undo records on the stack"
-        );
+        assert_eq!(s.undo_depth(), undo_depth_before, "search left undo records on the stack");
+    }
+
+    #[test]
+    fn ant_ordering_searches_all_moves() {
+        // Verify ant ordering doesn't drop moves: search completes without
+        // panicking and apply/unapply are balanced.
+        let mut s = State::new();
+        s.apply(Move::Place { piece: PieceId(0),  to: Coord::ORIGIN     }); // WQ
+        s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0)  }); // BQ
+        s.apply(Move::Place { piece: PieceId(8),  to: Coord::new(-1, 0) }); // WA1
+        s.apply(Move::Place { piece: PieceId(19), to: Coord::new(2, 0)  }); // BA1
+        let depth_before = s.undo_depth();
+        let mut tt = TranspositionTable::with_capacity_log2(14);
+        let (_, _, stats) = search(&mut s, 3, &mut tt);
+        assert!(stats.nodes > 0);
+        assert_eq!(s.undo_depth(), depth_before, "search left undo records on the stack");
     }
 }
