@@ -12,10 +12,9 @@
 //! - The TT is direct-mapped (no buckets/chaining). Entries are unconditionally
 //!   replaced on collision; this is the simplest scheme that demonstrates the
 //!   payoff and is fine for the depth-of-search we exercise here.
-//! - Eval is intentionally trivial — queen-surroundedness — because the brief
-//!   carves the AlphaZero-style learned evaluator out as a separate future
-//!   phase. The search machinery is the deliverable here; the eval can swap
-//!   later without touching anything in this file.
+//! - Eval is a five-feature heuristic (queen surroundedness, mobility, development,
+//!   queen immobilisation). The weights are starting points; Texel-style tuning
+//!   is planned for Phase 7. The AlphaZero learned evaluator is Phase 8.
 //!
 //! ## TT mate-score encoding
 //!
@@ -34,7 +33,7 @@
 //!   negative mate  → score  = stored + ply
 
 use crate::moves::Move;
-use crate::piece::{queen_of, Color, PieceSlot, PieceType};
+use crate::piece::{queen_of, Color, PieceId, PieceSlot, PieceType};
 use crate::state::{Outcome, State};
 use smallvec::SmallVec;
 
@@ -359,20 +358,34 @@ fn terminal_score(outcome: Outcome, side_to_move: Color, ply: u32) -> i32 {
     }
 }
 
+// Evaluation weights. All heuristic scores stay well below MATE_THRESHOLD.
+const W_OPP_QUEEN_NBRS: i32 = 12; // each piece surrounding opponent queen (pressure)
+const W_OWN_QUEEN_NBRS: i32 = 15; // each piece surrounding own queen (defensive urgency)
+const W_DEVELOPMENT:     i32 =  5; // per piece-in-hand delta (opp_in_hand − own_in_hand)
+// W_MOBILITY and W_OPP_QUEEN_IMMOB require gen:: calls at every leaf node.
+// Benchmarked at 61% nodes/sec regression at depth 4; deferred to Phase 7.
+
 /// Static evaluation, side-to-move perspective.
 ///
-/// Hive's loss condition is "queen surrounded". The crude-but-load-bearing
-/// heuristic is the difference in own-queen and opponent-queen neighbour
-/// counts: getting the opponent closer to surrounded is good, getting your
-/// own queen closer to surrounded is bad. A queen still in hand contributes 0
-/// neighbours — it's safe but means the player hasn't started threats yet.
+/// Three active features (features 3 and 5 deferred — see weight comments):
+///   1. Opponent queen neighbours  (W_OPP_QUEEN_NBRS per neighbour)
+///   2. Own queen neighbours       (W_OWN_QUEEN_NBRS per neighbour, subtracted)
+///   4. Development advantage      (W_DEVELOPMENT × pieces-in-hand delta)
 fn evaluate(state: &State) -> i32 {
     let stm = state.side_to_move();
     let opp = stm.other();
-    let own = queen_neighbours(state, stm) as i32;
-    let theirs = queen_neighbours(state, opp) as i32;
-    // Each neighbour ≈ 1/6 of a mate threat. Weight 10 so scores have headroom.
-    (theirs - own) * 10
+
+    // Features 1 & 2: queen surroundedness (queen_neighbours returns 0 if in hand)
+    let opp_q_nbrs = queen_neighbours(state, opp) as i32;
+    let own_q_nbrs = queen_neighbours(state, stm) as i32;
+
+    // Feature 4: development (symmetric at game start, safe to compute always)
+    let own_in_hand = pieces_in_hand(state, stm) as i32;
+    let opp_in_hand = pieces_in_hand(state, opp) as i32;
+
+    opp_q_nbrs  * W_OPP_QUEEN_NBRS
+  - own_q_nbrs  * W_OWN_QUEEN_NBRS
+  + (opp_in_hand - own_in_hand) * W_DEVELOPMENT
 }
 
 fn queen_neighbours(state: &State, color: Color) -> u8 {
@@ -391,11 +404,25 @@ fn queen_neighbours(state: &State, color: Color) -> u8 {
     n
 }
 
+fn pieces_in_hand(state: &State, color: Color) -> u8 {
+    PieceId::for_color(color)
+        .filter(|&pid| state.piece_slot(pid).is_in_hand())
+        .count() as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::coord::Coord;
-    use crate::piece::PieceId;
+    use crate::gen;
+
+    fn queen_is_immobilized(state: &State, color: Color) -> bool {
+        let q = queen_of(color);
+        if state.piece_slot(q).is_in_hand() { return false; }
+        let mut moves: SmallVec<[Move; 64]> = SmallVec::new();
+        gen::generate_movements(state, color, &mut moves);
+        !moves.iter().any(|m| matches!(m, Move::Slide { piece, .. } if *piece == q))
+    }
 
     #[test]
     fn search_depth_1_returns_some_move() {
@@ -451,17 +478,16 @@ mod tests {
 
     #[test]
     fn evaluation_rewards_attacking_opponent_queen() {
-        // Build a position where white has placed pieces next to black's queen.
-        // Side-to-move is whoever it ends up being; we check the sign relative
-        // to that.
+        // WB - WQ - BQ - BB in a line. Both queens have 2 neighbours and
+        // development is equal. With W_OWN_QUEEN_NBRS (15) > W_OPP_QUEEN_NBRS (12),
+        // equal threats produce a small negative score (defensive bias by design).
+        // Expected: 2×W_OPP − 2×W_OWN = 24 − 30 = −6.
         let mut s = State::new();
-        s.apply(Move::Place { piece: PieceId(0), to: Coord::ORIGIN });           // WQ
-        s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0) });        // BQ
-        s.apply(Move::Place { piece: PieceId(1), to: Coord::new(-1, 0) });        // W beetle
-        s.apply(Move::Place { piece: PieceId(12), to: Coord::new(2, 0) });        // B beetle
-        // Black has 1 neighbour on its queen; white has 1 neighbour on its queen.
-        // Eval should be 0 here (symmetric).
-        assert_eq!(evaluate(&s), 0);
+        s.apply(Move::Place { piece: PieceId(0),  to: Coord::ORIGIN        }); // WQ
+        s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0)     }); // BQ
+        s.apply(Move::Place { piece: PieceId(1),  to: Coord::new(-1, 0)    }); // W beetle
+        s.apply(Move::Place { piece: PieceId(12), to: Coord::new(2, 0)     }); // B beetle
+        assert_eq!(evaluate(&s), -6, "symmetric 2-nbr position should score −6 with current weights");
     }
 
     #[test]
@@ -534,5 +560,48 @@ mod tests {
         let (_, _, stats) = search(&mut s, 3, &mut tt);
         assert!(stats.nodes > 0);
         assert_eq!(s.undo_depth(), depth_before, "search left undo records on the stack");
+    }
+
+    #[test]
+    fn pieces_in_hand_counts_placed_pieces() {
+        let mut s = State::new();
+        assert_eq!(pieces_in_hand(&s, Color::White), 11);
+        assert_eq!(pieces_in_hand(&s, Color::Black), 11);
+        s.apply(Move::Place { piece: PieceId(0), to: Coord::ORIGIN }); // WQ placed
+        assert_eq!(pieces_in_hand(&s, Color::White), 10);
+        assert_eq!(pieces_in_hand(&s, Color::Black), 11);
+    }
+
+    #[test]
+    fn queen_immobilized_detects_articulation() {
+        // Queens in hand → not immobilised
+        let s = State::new();
+        assert!(!queen_is_immobilized(&s, Color::White));
+        assert!(!queen_is_immobilized(&s, Color::Black));
+
+        // WB - WQ - BQ - BB in a line: both queens are internal articulation points
+        let mut s = State::new();
+        s.apply(Move::Place { piece: PieceId(0),  to: Coord::ORIGIN        }); // WQ
+        s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0)     }); // BQ
+        s.apply(Move::Place { piece: PieceId(1),  to: Coord::new(-1, 0)    }); // WB
+        s.apply(Move::Place { piece: PieceId(12), to: Coord::new(2, 0)     }); // BB
+        assert!(queen_is_immobilized(&s, Color::White), "WQ should be immobilised (articulation)");
+        assert!(queen_is_immobilized(&s, Color::Black), "BQ should be immobilised (articulation)");
+    }
+
+    #[test]
+    fn evaluation_rewards_development_advantage() {
+        // Game with no queens placed yet: only development feature fires.
+        // 3 white pieces on board (8 in hand), 2 black (9 in hand); black's turn.
+        // development score = (8 − 9) × W_DEVELOPMENT = −5 from black's POV.
+        let mut s = State::new();
+        s.apply(Move::Place { piece: PieceId(1),  to: Coord::ORIGIN        }); // WB
+        s.apply(Move::Place { piece: PieceId(12), to: Coord::new(1, 0)     }); // BB
+        s.apply(Move::Place { piece: PieceId(3),  to: Coord::new(-1, 0)    }); // WG
+        s.apply(Move::Place { piece: PieceId(14), to: Coord::new(2, 0)     }); // BG
+        s.apply(Move::Place { piece: PieceId(6),  to: Coord::new(-2, 0)    }); // WS
+        // stm = black (less developed); expect negative score
+        assert!(evaluate(&s) < 0,
+            "less-developed side should score negatively; got {}", evaluate(&s));
     }
 }
