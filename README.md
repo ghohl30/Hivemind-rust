@@ -69,7 +69,36 @@ Axial `(q, r)` with six neighbour deltas defined once in `src/coord.rs`.
 
 ## UI
 
-A browser-playable frontend built with Leptos (CSR, compiled to WASM). Work in progress — see `ui/`.
+A browser-playable frontend built with Leptos (CSR, compiled to WASM).
+
+![Hive UI — opening position](docs/ui-screenshot.png)
+
+### Prerequisites
+
+- [Rust toolchain](https://rustup.rs/) with the `wasm32-unknown-unknown` target:
+  ```bash
+  rustup target add wasm32-unknown-unknown
+  ```
+- [Trunk](https://trunkrs.dev/) — the WASM bundler/dev server:
+  ```bash
+  cargo install trunk
+  ```
+
+### Run locally
+
+```bash
+cd ui
+trunk serve          # dev server at http://localhost:8080 with live reload
+```
+
+### Production build
+
+```bash
+cd ui
+trunk build --release   # output goes to ui/dist/
+```
+
+The `dist/` folder is self-contained and can be served from any static host.
 
 ## Development
 
