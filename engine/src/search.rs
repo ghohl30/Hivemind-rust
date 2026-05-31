@@ -51,6 +51,9 @@ pub struct SearchStats {
     pub tt_cutoffs: u64,
     pub beta_cutoffs: u64,
     pub tt_stores: u64,
+    /// Deepest fully-completed iteration (always equals `max_depth` for a
+    /// non-iterative call, equals the last completed depth for an ID search).
+    pub depth: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,16 +115,37 @@ impl TranspositionTable {
     }
 }
 
-/// Top-level entry point. Runs negamax to `depth`, returns
-/// `(score, best_move, stats)` from the root side-to-move's perspective.
+/// Top-level entry point. Runs iterative deepening negamax up to `max_depth`,
+/// returns `(score, best_move, stats)` from the root side-to-move's
+/// perspective. `stats.depth` reports the deepest completed iteration.
+///
+/// The TT is **not** cleared between iterations: entries from shallower
+/// iterations provide move-ordering hints that prune the deeper search.
+/// Callers are responsible for clearing the TT between game moves if they
+/// want to avoid stale entries from a prior position (though the key-match
+/// guard makes false hits rare).
 pub fn search(
     state: &mut State,
-    depth: u8,
+    max_depth: u8,
     tt: &mut TranspositionTable,
 ) -> (i32, Option<Move>, SearchStats) {
     let mut stats = SearchStats::default();
-    let score = negamax(state, depth, 0, -MATE_SCORE, MATE_SCORE, tt, &mut stats);
-    // After search, the root entry should contain the best move.
+    let mut score = 0i32;
+
+    for d in 1..=max_depth {
+        score = negamax(state, d, 0, -MATE_SCORE, MATE_SCORE, tt, &mut stats);
+        stats.depth = d;
+
+        // If we found a forced mate, no deeper search can improve on it —
+        // cut the loop early. The mate distance is correct because the TT
+        // stores root-relative scores.
+        if score.abs() >= MATE_THRESHOLD {
+            break;
+        }
+    }
+
+    // After search, the root entry (written at max depth or mate depth)
+    // holds the best move found across all iterations.
     let best = tt.probe(state.zobrist()).and_then(|e| e.best_move);
     (score, best, stats)
 }
@@ -422,5 +446,52 @@ mod tests {
         assert_eq!(tt_decode_score(encoded, 3), original);
         // Probed 2 plies deeper → mate distance appears 2 smaller.
         assert_eq!(tt_decode_score(encoded, 5), MATE_SCORE - 5);
+    }
+
+    #[test]
+    fn iterative_deepening_stats_depth_equals_max_depth() {
+        // The stats.depth field must report the deepest completed iteration.
+        let mut s = State::new();
+        let mut tt = TranspositionTable::with_capacity_log2(14);
+        let (_, _, stats) = search(&mut s, 3, &mut tt);
+        assert_eq!(stats.depth, 3, "stats.depth should equal max_depth when no forced mate");
+    }
+
+    #[test]
+    fn search_near_terminal_returns_non_pass_move() {
+        // Build a position with queens and ants on board (all moves legal) and
+        // run search at depth 4. This exercises the full iterative-deepening
+        // loop on a real midgame position and verifies:
+        //   1. The search completes without panicking.
+        //   2. A non-None, non-Pass move is returned.
+        //   3. State is left unmodified (balanced apply/unapply).
+        //
+        // Position: WQ + BQ + WA1 + BA1 — four pieces placed legally, queens
+        // on board so both sides can slide. The position is far from terminal
+        // but richly connected enough that depth-4 search exercises TT and
+        // move ordering thoroughly.
+        let mut s = State::new();
+        s.apply(Move::Place { piece: PieceId(0),  to: Coord::ORIGIN        }); // WQ
+        s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0)     }); // BQ
+        s.apply(Move::Place { piece: PieceId(8),  to: Coord::new(-1, 0)    }); // WA1
+        s.apply(Move::Place { piece: PieceId(19), to: Coord::new(2, 0)     }); // BA1
+
+        let undo_depth_before = s.undo_depth();
+        let mut tt = TranspositionTable::with_capacity_log2(16);
+        let (score, best_move, stats) = search(&mut s, 4, &mut tt);
+
+        let bm = best_move.expect("search at depth 4 must return a move");
+        assert!(
+            !matches!(bm, Move::Pass),
+            "search returned Pass in an open position (score={score}); \
+             legal_moves={:?}", s.legal_moves()
+        );
+        assert!(stats.nodes > 0);
+        assert_eq!(stats.depth, 4, "stats.depth must equal max_depth");
+        assert_eq!(
+            s.undo_depth(),
+            undo_depth_before,
+            "search left undo records on the stack"
+        );
     }
 }
