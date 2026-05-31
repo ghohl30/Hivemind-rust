@@ -64,6 +64,19 @@ pub enum Bound {
     Upper,
 }
 
+/// Move-list summary passed from an internal node to its leaf children.
+/// Lets evaluate() use the parent's already-generated moves rather than
+/// re-running gen:: for the opponent.
+#[derive(Clone, Copy)]
+struct OppInfo {
+    /// Legal move count for the side that just moved (becomes the leaf's OPP).
+    move_count: i32,
+    /// Whether that side's queen is on the board.
+    queen_on_board: bool,
+    /// True iff that side's queen is on the board but has no legal slides.
+    queen_immob: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct TtEntry {
     key: u64,
@@ -132,7 +145,7 @@ pub fn search(
     let mut score = 0i32;
 
     for d in 1..=max_depth {
-        score = negamax(state, d, 0, -MATE_SCORE, MATE_SCORE, tt, &mut stats);
+        score = negamax(state, d, 0, -MATE_SCORE, MATE_SCORE, tt, &mut stats, None);
         stats.depth = d;
 
         // If we found a forced mate, no deeper search can improve on it —
@@ -157,6 +170,7 @@ fn negamax(
     beta: i32,
     tt: &mut TranspositionTable,
     stats: &mut SearchStats,
+    opp_info: Option<OppInfo>,
 ) -> i32 {
     stats.nodes += 1;
 
@@ -166,7 +180,7 @@ fn negamax(
         return terminal_score(outcome, state.side_to_move(), ply);
     }
     if depth == 0 {
-        return evaluate(state);
+        return evaluate(state, opp_info);
     }
 
     let key = state.zobrist();
@@ -204,6 +218,19 @@ fn negamax(
     }
 
     let moves = state.legal_moves();
+
+    // Build OppInfo for children: the current STM's move data becomes the
+    // child's OPP data, so leaves can evaluate opponent mobility/immob for free.
+    let stm = state.side_to_move();
+    let stm_queen = queen_of(stm);
+    let stm_q_on_board = !state.piece_slot(stm_queen).is_in_hand();
+    let child_opp_info = OppInfo {
+        move_count: moves.len().max(1) as i32,
+        queen_on_board: stm_q_on_board,
+        queen_immob: stm_q_on_board
+            && !moves.iter().any(|m| matches!(m, Move::Slide { piece, .. } if *piece == stm_queen)),
+    };
+
     // Move ordering pass 1: TT move first (if still legal).
     // Move ordering pass 2: ant Slide moves tiered by proximity to opponent queen.
     //   Tier 1 — `to` adjacent to opponent queen (on board).
@@ -215,7 +242,7 @@ fn negamax(
     // This is a reorder only — every legal move is searched.
 
     // Determine the opponent's queen coord for tier-1 classification.
-    let opp = state.side_to_move().other();
+    let opp = stm.other();
     let opp_queen_coord = match state.piece_slot(queen_of(opp)) {
         PieceSlot::OnBoard { coord, .. } => Some(coord),
         _ => None,
@@ -274,7 +301,7 @@ fn negamax(
 
     for m in ordered.iter().copied() {
         state.apply(m);
-        let score = -negamax(state, depth - 1, ply + 1, -beta, -alpha, tt, stats);
+        let score = -negamax(state, depth - 1, ply + 1, -beta, -alpha, tt, stats, Some(child_opp_info));
         state.unapply();
 
         if score > best_score {
@@ -362,16 +389,21 @@ fn terminal_score(outcome: Outcome, side_to_move: Color, ply: u32) -> i32 {
 const W_OPP_QUEEN_NBRS: i32 = 12; // each piece surrounding opponent queen (pressure)
 const W_OWN_QUEEN_NBRS: i32 = 15; // each piece surrounding own queen (defensive urgency)
 const W_DEVELOPMENT:     i32 =  5; // per piece-in-hand delta (opp_in_hand − own_in_hand)
-// W_MOBILITY and W_OPP_QUEEN_IMMOB require gen:: calls at every leaf node.
-// Benchmarked at 61% nodes/sec regression at depth 4; deferred to Phase 7.
+const W_OPP_MOBILITY:    i32 =  0; // disabled: gating on queen placement causes eval discontinuity
+                                   // that 4× the depth-4 node count at any non-zero weight.
+const W_OPP_QUEEN_IMMOB: i32 = 80; // flat bonus: opponent queen has zero legal moves
 
 /// Static evaluation, side-to-move perspective.
 ///
-/// Three active features (features 3 and 5 deferred — see weight comments):
+/// Always-active features:
 ///   1. Opponent queen neighbours  (W_OPP_QUEEN_NBRS per neighbour)
 ///   2. Own queen neighbours       (W_OWN_QUEEN_NBRS per neighbour, subtracted)
 ///   4. Development advantage      (W_DEVELOPMENT × pieces-in-hand delta)
-fn evaluate(state: &State) -> i32 {
+///
+/// Features available when the parent passes OppInfo (zero extra gen calls):
+///   3. OPP mobility    (−W_OPP_MOBILITY × opp_move_count; gated on opp queen placed)
+///   5. OPP queen immob (W_OPP_QUEEN_IMMOB flat; gated on opp queen placed)
+fn evaluate(state: &State, opp_info: Option<OppInfo>) -> i32 {
     let stm = state.side_to_move();
     let opp = stm.other();
 
@@ -383,9 +415,20 @@ fn evaluate(state: &State) -> i32 {
     let own_in_hand = pieces_in_hand(state, stm) as i32;
     let opp_in_hand = pieces_in_hand(state, opp) as i32;
 
+    // Features 3 & 5: use pre-computed parent data; skip if unavailable (e.g. tests)
+    let (mob_score, immob_score) = match opp_info {
+        Some(info) if info.queen_on_board => (
+            -info.move_count * W_OPP_MOBILITY,
+            if info.queen_immob { W_OPP_QUEEN_IMMOB } else { 0 },
+        ),
+        _ => (0, 0),
+    };
+
     opp_q_nbrs  * W_OPP_QUEEN_NBRS
   - own_q_nbrs  * W_OWN_QUEEN_NBRS
   + (opp_in_hand - own_in_hand) * W_DEVELOPMENT
+  + mob_score
+  + immob_score
 }
 
 fn queen_neighbours(state: &State, color: Color) -> u8 {
@@ -473,7 +516,7 @@ mod tests {
     fn evaluation_is_symmetric_at_initial_state() {
         // Empty board, both queens in hand ⇒ eval is 0.
         let s = State::new();
-        assert_eq!(evaluate(&s), 0);
+        assert_eq!(evaluate(&s, None), 0);
     }
 
     #[test]
@@ -487,7 +530,7 @@ mod tests {
         s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0)     }); // BQ
         s.apply(Move::Place { piece: PieceId(1),  to: Coord::new(-1, 0)    }); // W beetle
         s.apply(Move::Place { piece: PieceId(12), to: Coord::new(2, 0)     }); // B beetle
-        assert_eq!(evaluate(&s), -6, "symmetric 2-nbr position should score −6 with current weights");
+        assert_eq!(evaluate(&s, None), -6, "symmetric 2-nbr position should score −6 with current weights");
     }
 
     #[test]
@@ -590,6 +633,20 @@ mod tests {
     }
 
     #[test]
+    fn evaluation_opp_info_adds_mobility_and_immob() {
+        let s = State::new();
+        let base = evaluate(&s, None);
+        // Simulate: OPP queen placed, 5 moves available, queen immobilised.
+        let with_info = evaluate(&s, Some(OppInfo {
+            move_count: 5,
+            queen_on_board: true,
+            queen_immob: true,
+        }));
+        // Expected delta: W_OPP_QUEEN_IMMOB + (-5 * W_OPP_MOBILITY) = 80 - 10 = 70
+        assert_eq!(with_info - base, W_OPP_QUEEN_IMMOB - 5 * W_OPP_MOBILITY);
+    }
+
+    #[test]
     fn evaluation_rewards_development_advantage() {
         // Game with no queens placed yet: only development feature fires.
         // 3 white pieces on board (8 in hand), 2 black (9 in hand); black's turn.
@@ -601,7 +658,7 @@ mod tests {
         s.apply(Move::Place { piece: PieceId(14), to: Coord::new(2, 0)     }); // BG
         s.apply(Move::Place { piece: PieceId(6),  to: Coord::new(-2, 0)    }); // WS
         // stm = black (less developed); expect negative score
-        assert!(evaluate(&s) < 0,
-            "less-developed side should score negatively; got {}", evaluate(&s));
+        assert!(evaluate(&s, None) < 0,
+            "less-developed side should score negatively; got {}", evaluate(&s, None));
     }
 }
