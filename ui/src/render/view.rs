@@ -117,6 +117,51 @@ pub fn occupied_coords(state: &State) -> Vec<Coord> {
     state.entries().map(|(c, _)| c).collect()
 }
 
+/// Whether the cell at `coord` is a "stack" worth inspecting: height >= 2,
+/// i.e. at least one piece is buried under the top. Mirrors the badge predicate
+/// (`TileView::is_stack`) but takes a `State` + `Coord` so the stack-inspector
+/// trigger can be decided without a `TileView` in hand.
+pub fn is_stack_cell(state: &State, coord: Coord) -> bool {
+    state.stack_at(coord).len() >= 2
+}
+
+/// One layer of a stack, for the click-to-open stack inspector popover.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StackLayer {
+    /// 0-based layer from the bottom (0 = ground piece). Render order is the
+    /// position in the returned `Vec`, which is bottom-to-top.
+    pub level: usize,
+    pub piece: PieceId,
+}
+
+impl StackLayer {
+    pub fn color(&self) -> Color {
+        self.piece.color()
+    }
+    pub fn piece_type(&self) -> PieceType {
+        self.piece.piece_type()
+    }
+    /// `true` for the current top of the stack (the visible piece on the board).
+    pub fn is_top(&self, stack_len: usize) -> bool {
+        self.level + 1 == stack_len
+    }
+}
+
+/// The stack at `coord` as a bottom-to-top list of [`StackLayer`]s for the
+/// inspector popover. Index 0 is the ground piece; the last element is the
+/// current top. Empty if the cell is unoccupied. Thin re-shaping of the engine's
+/// `State::stack_at` (which is already bottom-to-top) into a view-model that
+/// carries the per-layer level, so the popover can label "Bottom -> Top" and
+/// mark the top without the component recomputing indices.
+pub fn stack_layers(state: &State, coord: Coord) -> Vec<StackLayer> {
+    state
+        .stack_at(coord)
+        .into_iter()
+        .enumerate()
+        .map(|(level, piece)| StackLayer { level, piece })
+        .collect()
+}
+
 /// One grouped in-hand entry for a color: a piece type and how many of that
 /// type remain in that color's hand.
 #[derive(Clone, Debug, PartialEq)]
@@ -256,6 +301,58 @@ mod tests {
         // Turn 1 for both, queens in hand → no hint yet.
         assert!(!queen_must_be_placed(&state, Color::White));
         assert!(!queen_must_be_placed(&state, Color::Black));
+    }
+
+    #[test]
+    fn flat_cell_is_not_a_stack_and_yields_one_layer() {
+        let mut state = State::new();
+        let m = state.legal_moves()[0];
+        state.apply(m);
+        let coord = occupied_coords(&state)[0];
+        assert!(!is_stack_cell(&state, coord), "a single piece is not a stack");
+        let layers = stack_layers(&state, coord);
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].level, 0);
+        assert!(layers[0].is_top(1), "the only piece is the top");
+    }
+
+    #[test]
+    fn empty_cell_has_no_layers() {
+        let state = State::new();
+        let far = Coord::new(20, -20);
+        assert!(!is_stack_cell(&state, far));
+        assert!(stack_layers(&state, far).is_empty());
+    }
+
+    #[test]
+    fn beetle_stack_layers_are_bottom_to_top_and_match_stack_at() {
+        // Drive real play into a beetle climb so the layers come from a genuine
+        // stacked cell rather than a hand-built one.
+        let session = crate::render::demo::demo_session();
+        let state = session.state();
+        let stacked = occupied_coords(state)
+            .into_iter()
+            .find(|&c| is_stack_cell(state, c))
+            .expect("demo builds a beetle stack");
+
+        let raw = state.stack_at(stacked);
+        let layers = stack_layers(state, stacked);
+        assert_eq!(layers.len(), raw.len());
+        assert!(raw.len() >= 2);
+
+        // Levels are 0..n ascending, pieces match the engine's bottom-to-top
+        // order exactly, and only the last layer is the top.
+        for (i, layer) in layers.iter().enumerate() {
+            assert_eq!(layer.level, i);
+            assert_eq!(layer.piece, raw[i]);
+            assert_eq!(layer.is_top(raw.len()), i + 1 == raw.len());
+        }
+        // The view-model top equals the board's rendered top piece.
+        let top_view = board_tiles(state)
+            .into_iter()
+            .find(|t| t.coord == stacked)
+            .unwrap();
+        assert_eq!(layers.last().unwrap().piece, top_view.piece);
     }
 
     #[test]

@@ -266,6 +266,120 @@
         font-variant-numeric: tabular-nums;
       }
 
+      /* Stack badge is now an inspect affordance: hint at it being tappable. */
+      .stack-badge { cursor: pointer; }
+      .stack-badge:hover circle { fill: #c96a2c; }
+
+      /* Stack inspector popover. A fixed full-viewport backdrop catches
+         click-elsewhere to dismiss; the box itself is a frosted parchment panel
+         placed (and viewport-clamped) near the tapped badge. */
+      .stack-pop-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 50;
+        /* Transparent: it only intercepts the dismiss click; the board stays
+           visible behind it. */
+        background: transparent;
+      }
+      .stack-pop {
+        position: fixed;
+        width: 220px;
+        max-width: calc(100vw - 16px);
+        max-height: min(320px, calc(100dvh - 16px));
+        display: flex;
+        flex-direction: column;
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 16px;
+        box-shadow: var(--shadow);
+        -webkit-backdrop-filter: blur(12px);
+        backdrop-filter: blur(12px);
+        padding: 0.6rem 0.7rem 0.5rem;
+        color: var(--ink);
+      }
+      .stack-pop-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+        margin-bottom: 0.45rem;
+      }
+      .stack-pop-close {
+        border: 1px solid var(--panel-border);
+        border-radius: 999px;
+        width: 1.6rem;
+        height: 1.6rem;
+        line-height: 1;
+        background: rgba(255, 248, 236, 0.92);
+        color: var(--ink);
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: 1rem;
+        cursor: pointer;
+      }
+      .stack-pop-close:hover { background: #fff; }
+      .stack-pop-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 0.35rem;
+      }
+      .stack-pop-row {
+        display: flex;
+        align-items: center;
+        gap: 0.55rem;
+        padding: 0.25rem;
+        border-radius: 10px;
+      }
+      .stack-pop-row.top {
+        background: rgba(223, 183, 74, 0.22);
+        outline: 1px solid rgba(168, 132, 47, 0.5);
+      }
+      .stack-pop-tile {
+        flex: 0 0 auto;
+        width: 34px;
+        height: 34px;
+        border: 1.5px solid;
+        border-radius: 9px;
+        display: grid;
+        place-items: center;
+        box-shadow: 0 4px 10px -8px rgba(60, 40, 20, 0.6);
+      }
+      .stack-pop-glyph {
+        width: 72%;
+        height: 72%;
+        display: block;
+      }
+      .stack-pop-meta {
+        display: flex;
+        flex-direction: column;
+        gap: 0.05rem;
+        min-width: 0;
+      }
+      .stack-pop-name {
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: 0.92rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .stack-pop-pos {
+        font-size: 0.68rem;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--ink-soft);
+      }
+      .stack-pop-foot {
+        margin: 0.45rem 0 0;
+        font-size: 0.68rem;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--ink-soft);
+        text-align: center;
+      }
+
       .outcome {
         padding: 0.8rem 1rem;
         background: var(--ink);
