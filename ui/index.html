@@ -7,43 +7,246 @@
     <link data-trunk rel="rust" data-wasm-opt="z" />
     <link data-trunk rel="copy-dir" href="assets" />
     <style>
+      /* Parchment skin. Warm paper gradient behind frosted panels; burnt-orange
+         accent, gold for legal-move highlights (used in PR4). Light theme only —
+         no color-scheme:dark so the chosen tones hold. */
       :root {
-        color-scheme: light dark;
-        --bg: #f4f1ea;
-        --fg: #1c1b18;
+        --bg-top: #f6efe3;
+        --bg-bottom: #d7c3a4;
+        --panel: rgba(255, 248, 236, 0.84);
+        --panel-border: rgba(76, 54, 34, 0.16);
+        --ink: #20170f;
+        --ink-soft: #6b5942;
+        --accent: #b55d24;
+        --gold: #dfb74a;
+        --tile-white: #f2e8d0;
+        --tile-black: #463a31;
+        --shadow: 0 18px 40px -18px rgba(60, 40, 20, 0.45);
       }
       * { box-sizing: border-box; }
       html, body {
         margin: 0;
         height: 100%;
-        background: var(--bg);
-        color: var(--fg);
+        background: linear-gradient(160deg, var(--bg-top), var(--bg-bottom));
+        background-attachment: fixed;
+        color: var(--ink);
         font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
       }
+      /* Bound the whole app to the viewport so it never grows past the screen.
+         `100dvh` tracks the dynamic viewport (mobile URL bars), `overflow:
+         hidden` is the hard stop, and the column layout lets the play-area row
+         claim the leftover height below the title + status bar. */
       .app {
-        max-width: 960px;
+        max-width: 1200px;
         margin: 0 auto;
         padding: clamp(0.75rem, 2vw, 1.5rem);
         display: flex;
         flex-direction: column;
         gap: 1rem;
-        min-height: 100%;
+        height: 100dvh;
+        overflow: hidden;
       }
-      h1 { font-size: clamp(1.25rem, 4vw, 2rem); margin: 0; }
-      .board-placeholder {
-        flex: 1;
-        display: grid;
-        place-items: center;
-        border: 2px dashed currentColor;
-        border-radius: 12px;
-        opacity: 0.6;
-        min-height: 40vh;
+      h1 {
+        font-family: Georgia, "Times New Roman", serif;
+        font-weight: 700;
+        letter-spacing: 0.01em;
+        font-size: clamp(1.4rem, 4vw, 2.2rem);
+        margin: 0;
+        color: var(--ink);
       }
+
+      /* Uppercase, letterspaced eyebrow labels for small headings. */
+      .eyebrow {
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+        font-size: 0.7rem;
+        font-weight: 600;
+        color: var(--ink-soft);
+      }
+
+      /* Status bar: whose turn, turn number, placements, queen hint. */
       .status {
         display: flex;
         flex-wrap: wrap;
-        gap: 0.5rem 1.5rem;
+        align-items: center;
+        gap: 0.5rem 2rem;
+        padding: 0.7rem 1.1rem;
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 18px;
+        box-shadow: var(--shadow);
+        -webkit-backdrop-filter: blur(10px);
+        backdrop-filter: blur(10px);
         font-variant-numeric: tabular-nums;
+      }
+      .status-item {
+        display: flex;
+        flex-direction: column;
+        gap: 0.1rem;
+      }
+      .status-value {
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: 1.15rem;
+        color: var(--ink);
+      }
+      .status-hint {
+        align-self: center;
+        color: var(--accent);
+        font-weight: 600;
+      }
+
+      /* Play area: hands flank the board on wide screens, stack on narrow. */
+      .play-area {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1rem;
+        align-items: stretch;
+      }
+      .board {
+        flex: 1 1 320px;
+        min-width: 280px;
+        /* `min-height: 0` lets this child shrink below its intrinsic content
+           height so the row — and the SVG box it fills — is bounded by the
+           viewport. `overflow: hidden` is the safety net so the meet-fitted SVG
+           never spills past the panel. */
+        min-height: 0;
+        overflow: hidden;
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 24px;
+        box-shadow: var(--shadow);
+        -webkit-backdrop-filter: blur(10px);
+        backdrop-filter: blur(10px);
+        padding: 0.5rem;
+        /* Positioning context for the absolutely-filled SVG and the overlaid
+           view controls. */
+        position: relative;
+      }
+      .board-svg {
+        position: absolute;
+        inset: 0.5rem;
+        width: auto;
+        height: auto;
+        display: block;
+        touch-action: none; /* let pointer-drag pan instead of scrolling */
+        cursor: grab;
+      }
+      .board-svg:active { cursor: grabbing; }
+
+      /* Hex layers. Constant hex size; viewBox handles zoom. */
+      .hex { transition: fill 140ms ease, stroke 140ms ease; }
+      .hex.tile { stroke-linejoin: round; }
+      .hex.frontier {
+        fill: rgba(255, 250, 240, 0.35);
+        stroke: rgba(120, 92, 58, 0.28);
+        stroke-width: 1.5;
+      }
+      /* PR4 will toggle these on legal-target / selected tiles. */
+      .hex.legal {
+        fill: var(--gold);
+        stroke: #a8842f;
+      }
+      .hex.selected {
+        stroke: var(--accent);
+        stroke-width: 4;
+      }
+
+      /* Floating view controls (zoom -, fit, zoom +). */
+      .board-controls {
+        position: absolute;
+        right: 0.9rem;
+        bottom: 0.9rem;
+        display: flex;
+        gap: 0.4rem;
+        z-index: 2;
+      }
+      .ctrl-btn {
+        min-width: 2.2rem;
+        height: 2.2rem;
+        padding: 0 0.6rem;
+        border: 1px solid var(--panel-border);
+        border-radius: 999px;
+        background: rgba(255, 248, 236, 0.92);
+        color: var(--ink);
+        font-family: Georgia, "Times New Roman", serif;
+        font-size: 1rem;
+        line-height: 1;
+        cursor: pointer;
+        box-shadow: 0 4px 12px -6px rgba(60, 40, 20, 0.5);
+        transition: background 140ms ease, transform 140ms ease;
+      }
+      .ctrl-btn:hover { background: #fff; transform: translateY(-1px); }
+      .ctrl-btn:active { transform: translateY(0); }
+
+      /* Hand panels, bounded to the row height like the board. */
+      .hand {
+        flex: 1 1 200px;
+        min-width: 180px;
+        min-height: 0;
+        overflow-y: auto;
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 18px;
+        box-shadow: var(--shadow);
+        -webkit-backdrop-filter: blur(9px);
+        backdrop-filter: blur(9px);
+        padding: 0.9rem;
+      }
+      .hand-title { margin: 0 0 0.7rem; }
+      .hand-grid {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.55rem;
+      }
+      .hand-piece { line-height: 0; }
+      .hand-tile {
+        position: relative;
+        width: 56px;
+        height: 56px;
+        border: 1.5px solid;
+        border-radius: 14px;
+        display: grid;
+        place-items: center;
+        box-shadow: 0 6px 14px -10px rgba(60, 40, 20, 0.6);
+      }
+      .hand-glyph {
+        width: 70%;
+        height: 70%;
+        object-fit: contain;
+      }
+      .hand-count {
+        position: absolute;
+        right: -5px;
+        bottom: -5px;
+        min-width: 18px;
+        height: 18px;
+        padding: 0 4px;
+        border-radius: 9px;
+        background: var(--accent);
+        color: #f6efe3;
+        font-size: 11px;
+        line-height: 18px;
+        text-align: center;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .outcome {
+        padding: 0.8rem 1rem;
+        background: var(--ink);
+        color: var(--bg-top);
+        border-radius: 16px;
+        font-family: Georgia, "Times New Roman", serif;
+        font-weight: 700;
+        text-align: center;
+      }
+
+      /* On wide screens, keep the board the dominant column. */
+      @media (min-width: 800px) {
+        .board { flex: 2 1 480px; }
+        .hand { flex: 0 0 220px; }
       }
     </style>
   </head>

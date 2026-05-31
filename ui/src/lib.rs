@@ -5,3 +5,4 @@
 //! on the native target.
 
 pub mod game;
+pub mod render;
