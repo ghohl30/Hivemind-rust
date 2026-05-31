@@ -1,0 +1,25 @@
+[package]
+name = "hive-ui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Browser UI for the Hive engine (Leptos CSR -> WebAssembly)."
+
+[dependencies]
+# Engine compiled into the same WASM bundle; serde feature enables Move/leaf-type
+# JSON for save/load and the eventual Web Worker search boundary.
+hive-engine = { path = "../engine", features = ["serde"] }
+
+# Leptos client-side rendering. `csr` selects the browser-only build (no SSR).
+leptos = { version = "0.6", features = ["csr"] }
+
+# WASM <-> JS glue and browser API bindings.
+wasm-bindgen = "0.2"
+web-sys = "0.3"
+
+# Serialization for DTOs / persisted move lists.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Surface Rust panics in the browser console instead of an opaque "unreachable".
+console_error_panic_hook = "0.1"

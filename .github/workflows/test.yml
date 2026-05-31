@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  engine:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,14 +24,51 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # Engine CI is scoped to -p hive-engine so UI build settings can never
+      # break it. Behavior is otherwise identical to the pre-UI workflow.
       - name: build (release)
-        run: cargo build --release
+        run: cargo build --release -p hive-engine
 
       # Release run is fast; debug exercises the proptest with all invariants
       # enabled (round-trip, zobrist-from-scratch, cache-from-scratch, one-hive,
       # terminal-consistency) — the safety net for any State / cache change.
       - name: test (release)
-        run: cargo test --release
+        run: cargo test --release -p hive-engine
 
       - name: test (debug)
-        run: cargo test
+        run: cargo test -p hive-engine
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain (+ wasm32 target)
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ui-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-ui-
+
+      - name: install trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      # Full bundle build (compiles the UI crate + the engine into WASM and
+      # runs wasm-bindgen). If trunk regresses, the cargo wasm build below still
+      # gives a clean compile signal.
+      - name: trunk build
+        working-directory: ui
+        run: trunk build --release
+
+      - name: cargo build (wasm32)
+        run: cargo build -p hive-ui --target wasm32-unknown-unknown
