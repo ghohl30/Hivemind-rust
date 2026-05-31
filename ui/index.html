@@ -143,14 +143,26 @@
         stroke: rgba(120, 92, 58, 0.28);
         stroke-width: 1.5;
       }
-      /* PR4 will toggle these on legal-target / selected tiles. */
+      /* Toggled on legal-target / selected tiles (PR4). */
       .hex.legal {
         fill: var(--gold);
         stroke: #a8842f;
+        cursor: pointer;
+      }
+      /* A legal landing on a frontier (empty) cell: gold, but keep the faint
+         outline readable. */
+      .hex.frontier.legal {
+        fill: var(--gold);
+        stroke: #a8842f;
+        cursor: pointer;
       }
       .hex.selected {
         stroke: var(--accent);
         stroke-width: 4;
+      }
+      .pass-btn {
+        border-radius: 12px;
+        font-weight: 700;
       }
 
       /* Floating view controls (zoom -, fit, zoom +). */
@@ -200,8 +212,29 @@
         flex-wrap: wrap;
         gap: 0.55rem;
       }
-      .hand-piece { line-height: 0; }
+      /* Hand chips are buttons (PR4): reset native button chrome so they look
+         like the PR7 tiles, then layer interaction states on top. */
+      .hand-piece {
+        line-height: 0;
+        padding: 0;
+        border: none;
+        background: none;
+        font: inherit;
+        cursor: default;
+        border-radius: 16px;
+      }
+      .hand-piece.selectable { cursor: pointer; }
+      .hand-piece:disabled { opacity: 0.55; }
+      .hand-piece.selectable:hover .hand-tile {
+        transform: translateY(-2px);
+      }
+      .hand-piece.selected .hand-tile,
+      .hand-tile.selected {
+        outline: 3px solid var(--accent);
+        outline-offset: 2px;
+      }
       .hand-tile {
+        transition: transform 120ms ease;
         position: relative;
         width: 56px;
         height: 56px;

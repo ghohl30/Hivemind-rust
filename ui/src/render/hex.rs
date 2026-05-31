@@ -73,6 +73,43 @@ pub fn hex_polygon_points(centre: Point, size: f64) -> String {
     s
 }
 
+/// Inverse of [`axial_to_pixel`]: the axial [`Coord`] whose hex contains the
+/// user-space point `p`, for a pointy-top layout with hex `size`.
+///
+/// Solves the forward transform for fractional `(q, r)`, then rounds to the
+/// nearest hex via cube rounding (the standard hex-grid technique: round the
+/// three cube coords, then fix up whichever drifted most so they re-sum to
+/// zero). A click anywhere inside a hex maps to that hex's coord.
+pub fn pixel_to_axial(p: Point, size: f64) -> Coord {
+    // Forward: x = size*sqrt3*(q + r/2); y = size*1.5*r.
+    let r = p.y / (size * 1.5);
+    let q = p.x / (size * SQRT3) - r / 2.0;
+    round_axial(q, r)
+}
+
+/// Round fractional axial `(q, r)` to the nearest hex using cube rounding.
+fn round_axial(q: f64, r: f64) -> Coord {
+    // Axial -> cube: x=q, z=r, y=-x-z.
+    let x = q;
+    let z = r;
+    let y = -x - z;
+    let mut rx = x.round();
+    let ry = y.round();
+    let mut rz = z.round();
+    let dx = (rx - x).abs();
+    let dy = (ry - y).abs();
+    let dz = (rz - z).abs();
+    // Re-derive whichever of the two coords we keep (`rx`, `rz`) drifted most,
+    // so x+y+z == 0 holds. We only ever read `rx` and `rz` for the axial result,
+    // so `ry` never needs fixing up.
+    if dx > dy && dx > dz {
+        rx = -ry - rz;
+    } else if dy <= dz {
+        rz = -rx - ry;
+    }
+    Coord::new(rx as i16, rz as i16)
+}
+
 /// An axis-aligned bounding box in SVG user units.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BBox {
@@ -532,6 +569,37 @@ mod tests {
         let c = client_to_user(vb, 200.0, 100.0, 400.0, 200.0);
         approx(c.x, 50.0);
         approx(c.y, 50.0);
+    }
+
+    #[test]
+    fn pixel_to_axial_inverts_axial_to_pixel() {
+        // Every cell's centre must round-trip back to that cell.
+        let size = 17.0;
+        for q in -6..=6 {
+            for r in -6..=6 {
+                let c = Coord::new(q, r);
+                let centre = axial_to_pixel(c, size);
+                assert_eq!(pixel_to_axial(centre, size), c, "centre of {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pixel_to_axial_maps_interior_points_to_the_hex() {
+        // A point nudged a fraction toward each neighbour from a hex centre must
+        // still resolve to the original hex (it stays inside).
+        let size = 20.0;
+        let c = Coord::new(2, -1);
+        let centre = axial_to_pixel(c, size);
+        for n in c.neighbours() {
+            let np = axial_to_pixel(n, size);
+            // 30% of the way toward the neighbour: still inside `c`'s hex.
+            let p = Point {
+                x: centre.x + 0.3 * (np.x - centre.x),
+                y: centre.y + 0.3 * (np.y - centre.y),
+            };
+            assert_eq!(pixel_to_axial(p, size), c, "30% toward {n:?}");
+        }
     }
 
     #[test]
