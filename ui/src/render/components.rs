@@ -100,6 +100,16 @@ fn HexTile(tile: TileView) -> impl IntoView {
     let gx = centre.x - g / 2.0;
     let gy = centre.y - g / 2.0;
 
+    // The glyph SVGs are `currentColor` silhouettes, but an externally
+    // referenced `<image>` renders in its own document context, so neither the
+    // host's CSS `color` nor `fill` reach its `currentColor` — it always paints
+    // the SVG's intrinsic default (black). That made the black player's glyph
+    // black-on-dark and unreadable. Recolor the image by its alpha via a
+    // per-tile `feFlood`+`feComposite(in)` filter: flood the desired color and
+    // keep it only where the glyph is opaque, so the host fully controls color.
+    let filter_id = format!("glyph-{}-{}", tile.coord.q, tile.coord.r);
+    let filter_ref = format!("url(#{filter_id})");
+
     // Badge in the upper-right corner of the hex.
     let badge_cx = centre.x + HEX_SIZE * 0.55;
     let badge_cy = centre.y - HEX_SIZE * 0.55;
@@ -112,14 +122,18 @@ fn HexTile(tile: TileView) -> impl IntoView {
             {glyph
                 .map(|url| {
                     view! {
-                        // CSS `color` drives the currentColor silhouette.
+                        // Recolor the silhouette via its alpha (see note above).
+                        <filter id=filter_id.clone() color-interpolation-filters="sRGB">
+                            <feFlood flood-color=glyph_col result="c" />
+                            <feComposite in="c" in2="SourceGraphic" operator="in" />
+                        </filter>
                         <image
                             href=url
                             x=gx
                             y=gy
                             width=g
                             height=g
-                            style=format!("color:{glyph_col};")
+                            filter=filter_ref.clone()
                             preserveAspectRatio="xMidYMid meet"
                         />
                     }
@@ -219,7 +233,21 @@ fn HandPanel(color: Color, entries: Vec<HandEntry>) -> impl IntoView {
                                 >
                                     {glyph
                                         .map(|url| {
-                                            view! { <img class="hand-glyph" src=url alt="" /> }
+                                            // Recolor via CSS mask: the `<span>`'s
+                                            // background paints in the host glyph
+                                            // color, masked to the SVG silhouette's
+                                            // alpha. (An `<img>` would render the
+                                            // SVG's intrinsic black instead.)
+                                            view! {
+                                                <span
+                                                    class="hand-glyph"
+                                                    style=format!(
+                                                        "background-color:{glyph_col};\
+                                                         -webkit-mask:url({url}) center/contain no-repeat;\
+                                                         mask:url({url}) center/contain no-repeat;",
+                                                    )
+                                                ></span>
+                                            }
                                         })}
                                     <span class="hand-count">{e.count.to_string()}</span>
                                 </div>

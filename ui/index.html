@@ -50,9 +50,14 @@
         font-weight: 600;
       }
 
-      /* Play area: hands flank the board on wide screens, stack on narrow. */
+      /* Play area: hands flank the board on wide screens, stack on narrow.
+         `min-height: 0` lets the board flex child actually shrink/grow and
+         resolve a height instead of being driven by its content's intrinsic
+         size (the default `min-height: auto` on flex items is what previously
+         left the SVG without a resolved height to fill). */
       .play-area {
         flex: 1;
+        min-height: 0;
         display: flex;
         flex-wrap: wrap;
         gap: 1rem;
@@ -61,16 +66,21 @@
       .board {
         flex: 1 1 320px;
         min-width: 280px;
-        min-height: 50vh;
+        min-height: 60vh;
         background: var(--panel);
         border: 1px solid var(--panel-border);
         border-radius: 12px;
         padding: 0.5rem;
-        display: flex;
+        /* Establish a positioning context and a resolved box for the SVG to
+           fill. The SVG is absolutely positioned to fill this box, so its
+           height no longer depends on the fragile flex-item height chain. */
+        position: relative;
       }
       .board-svg {
-        width: 100%;
-        height: 100%;
+        position: absolute;
+        inset: 0.5rem; /* match padding so the hive insets from the panel edge */
+        width: auto;
+        height: auto;
         display: block;
       }
 
