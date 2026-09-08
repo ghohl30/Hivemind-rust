@@ -47,39 +47,31 @@ impl Eval for LegacyEval {
     }
 }
 
-/// Danger contributed by each *enemy* piece adjacent to a queen, indexed by how
-/// many there are.
+/// Danger to a queen, indexed by how many of its six neighbours are occupied.
 ///
-/// Escalating rather than linear because the danger is not linear: the sixth
-/// neighbour ends the game, the first is barely a threat. A linear term — which
-/// is what the engine had — values spreading pressure across two queens' worth
-/// of half-surrounds equally with closing out one, and so declines to finish
-/// anything.
+/// Convex, because the danger is not linear: the sixth neighbour ends the game,
+/// the first is barely a threat. A linear schedule — which is what the engine
+/// shipped with — values two half-surrounded queens exactly as highly as one
+/// nearly-finished one, so it spreads pressure and never closes anything out.
 ///
-/// Index 6 is unreachable in play (a surrounded queen is terminal, and
-/// `negamax` checks that before ever calling `evaluate`), but is filled
-/// defensively. It must stay well under `MATE_THRESHOLD` so a heuristic score is
-/// never mistaken for a forced mate.
-const ENEMY_ADJ: [i32; 7] = [0, 8, 18, 36, 70, 130, 250];
+/// **Owner-agnostic on purpose, and this is a correction.** An earlier version
+/// of this table split neighbours into enemy and own, weighting an own piece at
+/// roughly a quarter of an enemy one, on the reasoning that you can usually move
+/// your own piece away. Measured over 300 games it scored 48.5% +/- 2.9% against
+/// the plain linear term — no better, and slightly worse. The likely reason is
+/// that Hive's win condition counts *all six* neighbours regardless of who owns
+/// them, so discounting your own pieces makes the evaluation less aligned with
+/// the thing that actually ends the game: an opponent whose own pieces crowd
+/// their queen really is losing, and that version could barely see it.
+///
+/// Scaled to stay near the old linear term's magnitude at low counts so this
+/// changes the shape of the evaluation without changing its units.
+///
+/// Index 6 is unreachable — `negamax` checks for a terminal position before
+/// calling `evaluate` — but is filled defensively, and must stay well below
+/// `MATE_THRESHOLD` so a heuristic score is never read as a forced mate.
+const QUEEN_ADJ: [i32; 7] = [0, 6, 15, 30, 56, 96, 160];
 
-/// Danger contributed by each *friendly* piece adjacent to a queen.
-///
-/// Much milder than an enemy piece at the same count. A piece of your own
-/// beside your queen still fills a cell, but you may be able to move it away;
-/// an enemy piece there is a committed attacker that you cannot remove. The
-/// engine had no way to express this difference at all.
-const OWN_ADJ: [i32; 7] = [0, 2, 5, 10, 18, 30, 60];
-
-/// Danger from an *enemy* beetle sitting on top of a queen.
-///
-/// Only the top piece of a stack may move, so a covered queen is completely
-/// immobile until the beetle leaves — and the side that put it there chooses
-/// when that is. It also plugs the queen's own cell against her escaping, which
-/// no neighbour count captures: the ring tables above score the six cells
-/// *around* the queen and are blind to the one she is standing in.
-///
-/// Priced just above a fourth attacker (70) and below a fifth (130): severe,
-/// but not on its own a loss.
 const ENEMY_COVER: i32 = 90;
 
 /// Danger from your *own* beetle sitting on your queen.
@@ -104,7 +96,7 @@ impl Eval for CurrentEval {
 /// adjacent piece. Higher is worse for `color`.
 fn queen_danger(state: &State, color: Color) -> i32 {
     let (enemy, own) = queen_ring(state, color);
-    ENEMY_ADJ[enemy as usize] + OWN_ADJ[own as usize] + cover_danger(state, color)
+    QUEEN_ADJ[(enemy + own) as usize] + cover_danger(state, color)
 }
 
 /// Danger to `color`'s queen from being buried under a beetle.
@@ -216,24 +208,11 @@ mod tests {
         // The marginal value of the next enemy piece must strictly increase.
         // A linear term cannot finish a queen off; this is the property that
         // fixes that, so assert it directly rather than trusting the literals.
-        let deltas: Vec<i32> = ENEMY_ADJ.windows(2).map(|w| w[1] - w[0]).collect();
+        let deltas: Vec<i32> = QUEEN_ADJ.windows(2).map(|w| w[1] - w[0]).collect();
         for pair in deltas.windows(2) {
             assert!(
                 pair[1] > pair[0],
-                "ENEMY_ADJ must be convex, got deltas {deltas:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn enemy_neighbours_outweigh_own_at_every_count() {
-        // An enemy piece beside your queen is a committed attacker; one of your
-        // own can often step away. If this ever inverts, the engine would start
-        // preferring to be surrounded by the opponent.
-        for n in 0..ENEMY_ADJ.len() {
-            assert!(
-                ENEMY_ADJ[n] >= OWN_ADJ[n],
-                "enemy weight must dominate own weight at count {n}"
+                "QUEEN_ADJ must be convex, got deltas {deltas:?}"
             );
         }
     }
@@ -303,7 +282,7 @@ mod tests {
     fn cover_is_priced_between_the_fourth_and_fifth_attacker() {
         // Anchors the weight against the ring schedule rather than leaving it a
         // free-floating magic number.
-        assert!(ENEMY_COVER > ENEMY_ADJ[4] && ENEMY_COVER < ENEMY_ADJ[5]);
+        assert!(ENEMY_COVER > QUEEN_ADJ[4] && ENEMY_COVER < QUEEN_ADJ[5]);
     }
 
     #[test]
@@ -314,10 +293,28 @@ mod tests {
     }
 
     #[test]
+    fn ring_counts_every_neighbour_equally() {
+        // Regression guard on a measured result: an owner-weighted version of
+        // this table scored 48.5% over 300 games against the plain linear term.
+        // Hive's win condition counts all six neighbours whoever owns them, so
+        // the danger must depend only on how many cells are filled.
+        let mut a = State::new();
+        play(&mut a, Move::Place { piece: PieceId(0), to: Coord::ORIGIN });
+        play(&mut a, Move::Place { piece: PieceId(11), to: Coord::new(1, 0) });
+
+        let (e, o) = queen_ring(&a, Color::White);
+        assert_eq!(
+            QUEEN_ADJ[(e + o) as usize],
+            QUEEN_ADJ[1],
+            "one neighbour is one neighbour, regardless of colour"
+        );
+    }
+
+    #[test]
     fn heuristic_scores_stay_below_mate() {
         // A heuristic score reaching MATE_THRESHOLD would be read as a forced
         // win and would cut iterative deepening short.
-        let worst = ENEMY_ADJ[6] + OWN_ADJ[6] + ENEMY_COVER;
+        let worst = QUEEN_ADJ[6] + ENEMY_COVER;
         assert!(
             worst < crate::search::MATE_THRESHOLD,
             "eval magnitude {worst} must stay well below mate scores"
@@ -348,9 +345,9 @@ mod tests {
         let (e1, o1) = queen_ring(&one, Color::White);
         assert_eq!((e1, o1), (1, 0));
 
-        let d1 = ENEMY_ADJ[1];
-        let d2 = ENEMY_ADJ[2];
-        let d3 = ENEMY_ADJ[3];
+        let d1 = QUEEN_ADJ[1];
+        let d2 = QUEEN_ADJ[2];
+        let d3 = QUEEN_ADJ[3];
         assert!(d2 - d1 < d3 - d2, "pressure must accelerate, not just accumulate");
     }
 }
