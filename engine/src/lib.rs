@@ -58,8 +58,16 @@ pub use piece::{Color, PieceId, PieceSlot, PieceType, StackTop};
 // Game state and outcome
 pub use state::{Outcome, State};
 
-// Search: entry point, result types, and the transposition table
-pub use search::{search, SearchStats, TranspositionTable, MATE_SCORE, MATE_THRESHOLD};
+// Search: entry points, result types, and the transposition table.
+// `search_bounded` is the time-bounded form (UI engine-request #1): the caller
+// supplies the stop predicate, so the engine stays clock-free and therefore
+// safe to compile into the UI's WASM bundle, where `Instant::now()` panics.
+pub use search::{search, search_bounded, SearchStats, TranspositionTable, MATE_SCORE, MATE_THRESHOLD};
+
+// Native-only: wall-clock wrapper around `search_bounded`. Absent on wasm32 by
+// design — see its doc comment.
+#[cfg(not(target_arch = "wasm32"))]
+pub use search::search_timed;
 
 // Phase 6: engine-vs-engine game runner
 pub use game_runner::{play_game, GameResult};

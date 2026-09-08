@@ -44,6 +44,18 @@ pub const MATE_SCORE: i32 = 1_000_000;
 /// Anything beyond this is a forced win/loss; below is a heuristic eval.
 pub const MATE_THRESHOLD: i32 = MATE_SCORE - 1_000;
 
+/// Poll `should_stop` once every this many nodes (mask of a power of two minus
+/// one). Checking every node would put a vtable call in the hottest loop in the
+/// program; at ~1.2M nodes/sec this bounds overshoot past the deadline to well
+/// under a millisecond, which is noise against any realistic time budget.
+const NODE_CHECK_MASK: u64 = 1023;
+
+/// Returned by a subtree that was cut off by `should_stop`. Its score is
+/// meaningless and must never reach the TT or a caller — routing aborts through
+/// the error channel of a `Result` is what makes that structurally impossible
+/// rather than a matter of remembering to check a flag.
+struct Aborted;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SearchStats {
     pub nodes: u64,
@@ -129,26 +141,149 @@ pub fn search(
     max_depth: u8,
     tt: &mut TranspositionTable,
 ) -> (i32, Option<Move>, SearchStats) {
+    search_bounded(state, max_depth, tt, &mut |_| false)
+}
+
+/// Time-bounded search. Identical to [`search`] except that `should_stop` is
+/// polled periodically; when it returns `true` the search unwinds and reports
+/// the best move from the deepest **fully completed** iteration.
+///
+/// `should_stop` rather than a `Duration` because the engine must stay
+/// clock-free: `std::time::Instant::now()` compiles on `wasm32-unknown-unknown`
+/// but panics at runtime, and this crate is compiled into the browser UI's WASM
+/// bundle. The caller owns the clock — natively via [`search_timed`], in the
+/// browser via `performance.now()`.
+///
+/// The predicate receives `&SearchStats` so a caller can implement adaptive
+/// allocation (e.g. declining to start an iteration that cannot finish) without
+/// the engine needing a clock of its own. `stats.depth` is the last completed
+/// iteration, so a change in it marks an iteration boundary.
+///
+/// Guarantees:
+/// - Returns `Some` move for any non-terminal position, even if `should_stop`
+///   is already true on entry: depth 1 always runs to completion.
+/// - Never returns a move from a partially searched iteration.
+/// - Leaves `state` exactly as it was found, aborted or not.
+pub fn search_bounded(
+    state: &mut State,
+    max_depth: u8,
+    tt: &mut TranspositionTable,
+    should_stop: &mut dyn FnMut(&SearchStats) -> bool,
+) -> (i32, Option<Move>, SearchStats) {
     let mut stats = SearchStats::default();
-    let mut score = 0i32;
 
-    for d in 1..=max_depth {
-        score = negamax(state, d, 0, -MATE_SCORE, MATE_SCORE, tt, &mut stats);
-        stats.depth = d;
-
-        // If we found a forced mate, no deeper search can improve on it —
-        // cut the loop early. The mate distance is correct because the TT
-        // stores root-relative scores.
-        if score.abs() >= MATE_THRESHOLD {
-            break;
+    // A forced move needs no deliberation. `depth: 0` truthfully reports that
+    // no iteration ran; the returned score is not a search result and callers
+    // should not read meaning into it.
+    if state.is_terminal().is_none() {
+        let root_moves = state.legal_moves();
+        if root_moves.len() == 1 {
+            return (0, Some(root_moves[0]), stats);
         }
     }
 
-    // After search, the root entry (written at max depth or mate depth)
-    // holds the best move found across all iterations.
-    let best = tt.probe(state.zobrist()).and_then(|e| e.best_move);
+    let mut score = 0i32;
+    let mut best: Option<Move> = None;
+
+    for d in 1..=max_depth {
+        // Depth 1 is unconditional so we always have a move to return.
+        if d > 1 && should_stop(&stats) {
+            break;
+        }
+
+        match negamax(
+            state,
+            d,
+            0,
+            -MATE_SCORE,
+            MATE_SCORE,
+            tt,
+            &mut stats,
+            &mut *should_stop,
+        ) {
+            Ok(s) => {
+                score = s;
+                stats.depth = d;
+                // Read the root move now, while this iteration's root entry is
+                // the freshest thing in the table. Deferring the probe to after
+                // the loop would risk a later aborted iteration evicting it —
+                // the TT is direct-mapped and always-replace.
+                if let Some(m) = tt.probe(state.zobrist()).and_then(|e| e.best_move) {
+                    best = Some(m);
+                }
+                // A forced mate cannot be improved on by searching deeper. The
+                // distance is correct because the TT stores root-relative scores.
+                if score.abs() >= MATE_THRESHOLD {
+                    break;
+                }
+            }
+            // Discard the partial iteration entirely: it may have examined only
+            // the first few root moves, so its "best so far" is an artefact of
+            // move ordering rather than a judgement.
+            Err(Aborted) => break,
+        }
+    }
+
     (score, best, stats)
 }
+
+/// Native convenience wrapper: search under a wall-clock budget.
+///
+/// Two mechanisms combine to keep the budget. The hard cap comes from polling
+/// the deadline every [`NODE_CHECK_MASK`]`+1` nodes, so an overrunning iteration
+/// is cut off wherever it happens to be. The adaptive part is declining to
+/// *start* an iteration that the previous iteration's cost says cannot finish —
+/// without it, the engine would routinely burn the tail of its budget on work it
+/// then throws away.
+///
+/// Deliberately absent on `wasm32`: this would compile there and then panic at
+/// runtime inside `Instant::now()`. A compile error is the better failure.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn search_timed(
+    state: &mut State,
+    max_depth: u8,
+    tt: &mut TranspositionTable,
+    budget: std::time::Duration,
+) -> (i32, Option<Move>, SearchStats) {
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let mut iter_start = start;
+    let mut last_seen_depth = 0u8;
+
+    let mut should_stop = |stats: &SearchStats| -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(start);
+        if elapsed >= budget {
+            return true;
+        }
+        // `stats.depth` only advances when an iteration completes, so this is
+        // the iteration boundary and `now - iter_start` is what that iteration
+        // cost. Extrapolate the next one and stop if it cannot fit.
+        if stats.depth != last_seen_depth {
+            let this_iter = now.duration_since(iter_start);
+            last_seen_depth = stats.depth;
+            iter_start = now;
+            if this_iter.mul_f32(EFFECTIVE_BRANCHING_FACTOR) > budget - elapsed {
+                return true;
+            }
+        }
+        false
+    };
+
+    search_bounded(state, max_depth, tt, &mut should_stop)
+}
+
+/// Cost multiplier from one iterative-deepening iteration to the next, used to
+/// predict whether the next iteration fits in the remaining budget.
+///
+/// Measured from `examples/search_bench` on the opening position, where
+/// iteration-over-iteration time ratios run ~3.5x early and ~10x by depth 6.
+/// Set below the observed worst case on purpose: guessing low costs some wasted
+/// work at the end of the budget, guessing high forfeits a whole ply. Re-measure
+/// if move ordering or eval cost changes materially.
+#[cfg(not(target_arch = "wasm32"))]
+const EFFECTIVE_BRANCHING_FACTOR: f32 = 5.0;
 
 fn negamax(
     state: &mut State,
@@ -158,16 +293,23 @@ fn negamax(
     beta: i32,
     tt: &mut TranspositionTable,
     stats: &mut SearchStats,
-) -> i32 {
+    should_stop: &mut dyn FnMut(&SearchStats) -> bool,
+) -> Result<i32, Aborted> {
     stats.nodes += 1;
+
+    // Cooperative abort. Interior nodes only: a leaf returns immediately, so
+    // checking there would only add cost to the most-executed path.
+    if depth > 0 && stats.nodes & NODE_CHECK_MASK == 0 && should_stop(stats) {
+        return Err(Aborted);
+    }
 
     // Terminal check first — game-over states have a definitive score
     // regardless of remaining depth.
     if let Some(outcome) = state.is_terminal() {
-        return terminal_score(outcome, state.side_to_move(), ply);
+        return Ok(terminal_score(outcome, state.side_to_move(), ply));
     }
     if depth == 0 {
-        return evaluate(state);
+        return Ok(evaluate(state));
     }
 
     let key = state.zobrist();
@@ -185,17 +327,17 @@ fn negamax(
                 Bound::Exact => {
                     stats.tt_hits += 1;
                     stats.tt_cutoffs += 1;
-                    return decoded;
+                    return Ok(decoded);
                 }
                 Bound::Lower if decoded >= beta => {
                     stats.tt_hits += 1;
                     stats.tt_cutoffs += 1;
-                    return decoded;
+                    return Ok(decoded);
                 }
                 Bound::Upper if decoded <= alpha => {
                     stats.tt_hits += 1;
                     stats.tt_cutoffs += 1;
-                    return decoded;
+                    return Ok(decoded);
                 }
                 _ => {
                     stats.tt_hits += 1;
@@ -275,8 +417,21 @@ fn negamax(
 
     for m in ordered.iter().copied() {
         state.apply(m);
-        let score = -negamax(state, depth - 1, ply + 1, -beta, -alpha, tt, stats);
+        let child = negamax(
+            state,
+            depth - 1,
+            ply + 1,
+            -beta,
+            -alpha,
+            tt,
+            stats,
+            &mut *should_stop,
+        );
+        // Unconditional, and before `?` inspects the result: this is what keeps
+        // every apply paired with an unapply at every frame no matter which
+        // depth the abort originated at.
         state.unapply();
+        let score = -child?;
 
         if score > best_score {
             best_score = score;
@@ -310,7 +465,7 @@ fn negamax(
     });
     stats.tt_stores += 1;
 
-    best_score
+    Ok(best_score)
 }
 
 /// Encode a score for TT storage.
@@ -518,6 +673,106 @@ mod tests {
         assert!(stats.nodes > 0);
         assert_eq!(stats.depth, 4, "stats.depth must equal max_depth");
         assert_eq!(s.undo_depth(), undo_depth_before, "search left undo records on the stack");
+    }
+
+    // --- time-bounded search -------------------------------------------
+
+    /// A predicate that fires once a node budget is spent, standing in for a
+    /// clock so the test is deterministic rather than timing-dependent.
+    fn node_budget(limit: u64) -> impl FnMut(&SearchStats) -> bool {
+        move |stats: &SearchStats| stats.nodes >= limit
+    }
+
+    #[test]
+    fn search_bounded_with_never_stop_matches_search() {
+        let mut a = State::new();
+        let mut b = State::new();
+        let mut tt_a = TranspositionTable::with_capacity_log2(14);
+        let mut tt_b = TranspositionTable::with_capacity_log2(14);
+
+        let (score_a, best_a, stats_a) = search(&mut a, 4, &mut tt_a);
+        let (score_b, best_b, stats_b) =
+            search_bounded(&mut b, 4, &mut tt_b, &mut |_| false);
+
+        assert_eq!(score_a, score_b);
+        assert_eq!(best_a, best_b);
+        assert_eq!(stats_a, stats_b, "a never-firing predicate must not perturb search");
+    }
+
+    #[test]
+    fn search_bounded_stops_short_of_max_depth() {
+        let mut s = State::new();
+        let mut tt = TranspositionTable::with_capacity_log2(16);
+        // Budget far below what depth 8 costs (baseline: depth 6 alone is ~106k
+        // nodes), so iterative deepening must be cut off partway.
+        let (_score, best, stats) = search_bounded(&mut s, 8, &mut tt, &mut node_budget(3_000));
+
+        assert!(best.is_some(), "must still return a move when the budget runs out");
+        assert!(
+            s.legal_moves().contains(&best.unwrap()),
+            "returned move must be legal"
+        );
+        assert!(
+            stats.depth < 8,
+            "expected an early stop, got a completed depth of {}",
+            stats.depth
+        );
+        assert!(stats.depth >= 1, "depth 1 must always complete");
+    }
+
+    #[test]
+    fn search_bounded_aborts_without_corrupting_state() {
+        let mut s = State::new();
+        // Play a few plies so the position is non-trivial and the undo stack
+        // has real depth to get wrong.
+        s.apply(Move::Place { piece: PieceId(0), to: Coord::ORIGIN });
+        s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0) });
+        s.apply(Move::Place { piece: PieceId(1), to: Coord::new(-1, 0) });
+
+        let before = s.clone();
+        let undo_before = s.undo_depth();
+        let mut tt = TranspositionTable::with_capacity_log2(16);
+
+        // Stop as early as the poll interval allows, so the abort unwinds from
+        // deep inside the tree rather than at a tidy boundary.
+        let (_score, best, _stats) = search_bounded(&mut s, 10, &mut tt, &mut node_budget(1));
+
+        assert!(best.is_some(), "depth 1 completes before any abort can fire");
+        assert_eq!(s.undo_depth(), undo_before, "abort left undo records on the stack");
+        assert_eq!(s, before, "abort did not restore the state bit-for-bit");
+    }
+
+    #[test]
+    fn search_bounded_returns_a_move_even_if_already_stopped() {
+        let mut s = State::new();
+        let mut tt = TranspositionTable::with_capacity_log2(12);
+        let (_score, best, stats) = search_bounded(&mut s, 6, &mut tt, &mut |_| true);
+
+        assert!(best.is_some(), "an already-expired budget must not yield None");
+        assert_eq!(stats.depth, 1, "exactly the mandatory depth-1 iteration should run");
+    }
+
+    #[test]
+    fn search_timed_respects_its_budget() {
+        use std::time::{Duration, Instant};
+
+        let mut s = State::new();
+        let mut tt = TranspositionTable::with_capacity_log2(18);
+        let budget = Duration::from_millis(150);
+
+        let started = Instant::now();
+        let (_score, best, stats) = search_timed(&mut s, 40, &mut tt, budget);
+        let elapsed = started.elapsed();
+
+        assert!(best.is_some());
+        // Generous ceiling: this asserts the cap engages at all, not a tight
+        // latency bound, so it stays reliable on a loaded CI runner.
+        assert!(
+            elapsed < budget * 20,
+            "budget {budget:?} overrun: took {elapsed:?} to depth {}",
+            stats.depth
+        );
+        assert!(stats.depth >= 1);
     }
 
     #[test]
