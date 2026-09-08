@@ -47,13 +47,71 @@ impl Eval for LegacyEval {
     }
 }
 
+/// Danger contributed by each *enemy* piece adjacent to a queen, indexed by how
+/// many there are.
+///
+/// Escalating rather than linear because the danger is not linear: the sixth
+/// neighbour ends the game, the first is barely a threat. A linear term — which
+/// is what the engine had — values spreading pressure across two queens' worth
+/// of half-surrounds equally with closing out one, and so declines to finish
+/// anything.
+///
+/// Index 6 is unreachable in play (a surrounded queen is terminal, and
+/// `negamax` checks that before ever calling `evaluate`), but is filled
+/// defensively. It must stay well under `MATE_THRESHOLD` so a heuristic score is
+/// never mistaken for a forced mate.
+const ENEMY_ADJ: [i32; 7] = [0, 8, 18, 36, 70, 130, 250];
+
+/// Danger contributed by each *friendly* piece adjacent to a queen.
+///
+/// Much milder than an enemy piece at the same count. A piece of your own
+/// beside your queen still fills a cell, but you may be able to move it away;
+/// an enemy piece there is a committed attacker that you cannot remove. The
+/// engine had no way to express this difference at all.
+const OWN_ADJ: [i32; 7] = [0, 2, 5, 10, 18, 30, 60];
+
 impl Eval for CurrentEval {
     fn evaluate(state: &State) -> i32 {
-        // Identical to LegacyEval for now — this is the baseline the gauntlet
-        // must first show itself unable to distinguish. It diverges in the
-        // evaluation PRs that follow.
-        LegacyEval::evaluate(state)
+        let stm = state.side_to_move();
+        let opp = stm.other();
+        // Symmetric between the two queens on purpose. Weighting your own
+        // queen's danger above the opponent's is a second, independent
+        // defensive bias, and stacking it on the ownership asymmetry above
+        // would make two knobs move at once. Left for the gauntlet to settle.
+        queen_danger(state, opp) - queen_danger(state, stm)
     }
+}
+
+/// How close `color`'s queen is to being surrounded, weighted by who owns each
+/// adjacent piece. Higher is worse for `color`.
+fn queen_danger(state: &State, color: Color) -> i32 {
+    let (enemy, own) = queen_ring(state, color);
+    ENEMY_ADJ[enemy as usize] + OWN_ADJ[own as usize]
+}
+
+/// Split of the pieces adjacent to `color`'s queen into `(enemy, own)`.
+///
+/// A queen in hand returns `(0, 0)` — safe, but generating no threats either.
+/// A covered queen still reports its ring; the beetle on top is a separate
+/// fact and not scored here.
+pub(crate) fn queen_ring(state: &State, color: Color) -> (u8, u8) {
+    let q = queen_of(color);
+    let coord = match state.piece_slot(q) {
+        PieceSlot::OnBoard { coord, .. } | PieceSlot::Covered { coord, .. } => coord,
+        PieceSlot::InHand => return (0, 0),
+    };
+    let board = state.board();
+    let (mut enemy, mut own) = (0u8, 0u8);
+    for nbr in coord.neighbours() {
+        if let Some(top) = board.top_at(nbr) {
+            if top.piece.color() == color {
+                own += 1;
+            } else {
+                enemy += 1;
+            }
+        }
+    }
+    (enemy, own)
 }
 
 /// Count of occupied cells adjacent to `color`'s queen.
@@ -111,13 +169,70 @@ mod tests {
     }
 
     #[test]
-    fn legacy_and_current_agree_before_divergence() {
-        // Guards the gauntlet's control arm: while CurrentEval delegates to
-        // LegacyEval, a Legacy-vs-Current run must be a true null experiment.
-        // This test is expected to be deleted when they intentionally diverge.
+    fn surround_pressure_is_convex() {
+        // The marginal value of the next enemy piece must strictly increase.
+        // A linear term cannot finish a queen off; this is the property that
+        // fixes that, so assert it directly rather than trusting the literals.
+        let deltas: Vec<i32> = ENEMY_ADJ.windows(2).map(|w| w[1] - w[0]).collect();
+        for pair in deltas.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "ENEMY_ADJ must be convex, got deltas {deltas:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enemy_neighbours_outweigh_own_at_every_count() {
+        // An enemy piece beside your queen is a committed attacker; one of your
+        // own can often step away. If this ever inverts, the engine would start
+        // preferring to be surrounded by the opponent.
+        for n in 0..ENEMY_ADJ.len() {
+            assert!(
+                ENEMY_ADJ[n] >= OWN_ADJ[n],
+                "enemy weight must dominate own weight at count {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn heuristic_scores_stay_below_mate() {
+        // A heuristic score reaching MATE_THRESHOLD would be read as a forced
+        // win and would cut iterative deepening short.
+        let worst = ENEMY_ADJ[6] + OWN_ADJ[6];
+        assert!(
+            worst < crate::search::MATE_THRESHOLD,
+            "eval magnitude {worst} must stay well below mate scores"
+        );
+    }
+
+    #[test]
+    fn queen_ring_splits_by_owner() {
         let mut s = State::new();
-        s.apply(Move::Place { piece: PieceId(0), to: Coord::ORIGIN });
-        s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0) });
-        assert_eq!(CurrentEval::evaluate(&s), LegacyEval::evaluate(&s));
+        s.apply(Move::Place { piece: PieceId(0), to: Coord::ORIGIN });      // WQ
+        s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0) });  // BQ
+        s.apply(Move::Place { piece: PieceId(1), to: Coord::new(-1, 0) });  // W beetle
+
+        // White queen: one black neighbour (BQ), one white neighbour (beetle).
+        assert_eq!(queen_ring(&s, Color::White), (1, 1));
+        // Black queen: one white neighbour (WQ), no black ones.
+        assert_eq!(queen_ring(&s, Color::Black), (1, 0));
+    }
+
+    #[test]
+    fn closing_in_on_the_enemy_queen_scores_better() {
+        // Two black pieces around the white queen must be worth strictly more
+        // to Black than one — and by more than the first one was worth.
+        let mut one = State::new();
+        one.apply(Move::Place { piece: PieceId(0), to: Coord::ORIGIN });
+        one.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0) });
+
+        let (e1, o1) = queen_ring(&one, Color::White);
+        assert_eq!((e1, o1), (1, 0));
+
+        let d1 = ENEMY_ADJ[1];
+        let d2 = ENEMY_ADJ[2];
+        let d3 = ENEMY_ADJ[3];
+        assert!(d2 - d1 < d3 - d2, "pressure must accelerate, not just accumulate");
     }
 }
