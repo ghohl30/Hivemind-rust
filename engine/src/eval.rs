@@ -70,6 +70,24 @@ const ENEMY_ADJ: [i32; 7] = [0, 8, 18, 36, 70, 130, 250];
 /// engine had no way to express this difference at all.
 const OWN_ADJ: [i32; 7] = [0, 2, 5, 10, 18, 30, 60];
 
+/// Danger from an *enemy* beetle sitting on top of a queen.
+///
+/// Only the top piece of a stack may move, so a covered queen is completely
+/// immobile until the beetle leaves — and the side that put it there chooses
+/// when that is. It also plugs the queen's own cell against her escaping, which
+/// no neighbour count captures: the ring tables above score the six cells
+/// *around* the queen and are blind to the one she is standing in.
+///
+/// Priced just above a fourth attacker (70) and below a fifth (130): severe,
+/// but not on its own a loss.
+const ENEMY_COVER: i32 = 90;
+
+/// Danger from your *own* beetle sitting on your queen.
+///
+/// Still bad — the queen cannot move — but you control when it steps off, so
+/// it is a self-inflicted tempo problem rather than a hostage situation.
+const OWN_COVER: i32 = 35;
+
 impl Eval for CurrentEval {
     fn evaluate(state: &State) -> i32 {
         let stm = state.side_to_move();
@@ -86,7 +104,32 @@ impl Eval for CurrentEval {
 /// adjacent piece. Higher is worse for `color`.
 fn queen_danger(state: &State, color: Color) -> i32 {
     let (enemy, own) = queen_ring(state, color);
-    ENEMY_ADJ[enemy as usize] + OWN_ADJ[own as usize]
+    ENEMY_ADJ[enemy as usize] + OWN_ADJ[own as usize] + cover_danger(state, color)
+}
+
+/// Danger to `color`'s queen from being buried under a beetle.
+///
+/// This is a boolean term, which is the shape that wrecked the opponent-mobility
+/// experiment on the earlier eval branch (a 4x node-count blowup). It is
+/// tolerable here for two reasons the mobility term could not claim: it flips
+/// only on a deliberate, rare climb onto one specific stack rather than as a
+/// side effect of an unrelated game-phase condition, and its magnitude is in
+/// scale with the ring tables rather than orders of magnitude larger. Node count
+/// is checked on every change regardless.
+fn cover_danger(state: &State, color: Color) -> i32 {
+    let q = queen_of(color);
+    // `Covered` is precisely "something is stacked on this piece" — no board
+    // lookup needed to know that much.
+    let coord = match state.piece_slot(q) {
+        PieceSlot::Covered { coord, .. } => coord,
+        _ => return 0,
+    };
+    match state.board().top_at(coord) {
+        Some(top) if top.piece.color() == color => OWN_COVER,
+        Some(_) => ENEMY_COVER,
+        // Unreachable: a Covered queen has something above it by definition.
+        None => 0,
+    }
 }
 
 /// Split of the pieces adjacent to `color`'s queen into `(enemy, own)`.
@@ -195,11 +238,86 @@ mod tests {
         }
     }
 
+    /// Apply a move, asserting it is legal first.
+    ///
+    /// `State::apply` only debug-asserts legality, so a release-mode test can
+    /// happily build an impossible position and assert things about it. This
+    /// makes the setup fail loudly in both profiles.
+    fn play(s: &mut State, m: Move) {
+        assert!(
+            s.legal_moves().contains(&m),
+            "test setup played an illegal move {m:?}"
+        );
+        s.apply(m);
+    }
+
+    /// Play the first legal move, for plies where the test does not care.
+    fn play_any(s: &mut State) {
+        let m = s.legal_moves()[0];
+        s.apply(m);
+    }
+
+    #[test]
+    fn beetle_cover_is_detected_and_owner_aware() {
+        let mut s = State::new();
+        play(&mut s, Move::Place { piece: PieceId(0), to: Coord::ORIGIN });      // WQ
+        play(&mut s, Move::Place { piece: PieceId(11), to: Coord::new(1, 0) });  // BQ
+        play(&mut s, Move::Place { piece: PieceId(1), to: Coord::new(-1, 0) });  // W beetle
+        play(&mut s, Move::Place { piece: PieceId(12), to: Coord::new(2, 0) });  // B beetle
+
+        assert_eq!(cover_danger(&s, Color::White), 0, "nothing on the white queen yet");
+
+        // White's beetle climbs onto its own queen: immobilised, but by choice.
+        play(&mut s, Move::Slide { piece: PieceId(1), to: Coord::ORIGIN });
+        assert_eq!(
+            cover_danger(&s, Color::White),
+            OWN_COVER,
+            "own beetle on own queen is the milder penalty"
+        );
+
+        play_any(&mut s); // black, don't care
+
+        // That same beetle steps across onto the black queen: now it is the
+        // hostage case, and must score strictly worse.
+        play(&mut s, Move::Slide { piece: PieceId(1), to: Coord::new(1, 0) });
+        assert_eq!(
+            cover_danger(&s, Color::Black),
+            ENEMY_COVER,
+            "enemy beetle on a queen is the severe penalty"
+        );
+        assert_eq!(
+            cover_danger(&s, Color::White),
+            0,
+            "white's queen is uncovered again once the beetle leaves"
+        );
+    }
+
+    #[test]
+    fn enemy_cover_outweighs_own_cover() {
+        // A hostage queen must always be worse than a self-blocked one,
+        // otherwise the engine would volunteer to bury its own queen.
+        assert!(ENEMY_COVER > OWN_COVER);
+    }
+
+    #[test]
+    fn cover_is_priced_between_the_fourth_and_fifth_attacker() {
+        // Anchors the weight against the ring schedule rather than leaving it a
+        // free-floating magic number.
+        assert!(ENEMY_COVER > ENEMY_ADJ[4] && ENEMY_COVER < ENEMY_ADJ[5]);
+    }
+
+    #[test]
+    fn uncovered_queen_has_no_cover_penalty() {
+        let s = State::new();
+        assert_eq!(cover_danger(&s, Color::White), 0);
+        assert_eq!(cover_danger(&s, Color::Black), 0);
+    }
+
     #[test]
     fn heuristic_scores_stay_below_mate() {
         // A heuristic score reaching MATE_THRESHOLD would be read as a forced
         // win and would cut iterative deepening short.
-        let worst = ENEMY_ADJ[6] + OWN_ADJ[6];
+        let worst = ENEMY_ADJ[6] + OWN_ADJ[6] + ENEMY_COVER;
         assert!(
             worst < crate::search::MATE_THRESHOLD,
             "eval magnitude {worst} must stay well below mate scores"
