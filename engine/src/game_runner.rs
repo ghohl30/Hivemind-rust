@@ -31,7 +31,25 @@ pub struct GameResult {
 /// Neither player is reset between calls; reuse or replace them to control
 /// whether TT state carries across games.
 pub fn play_game(white: &mut dyn Player, black: &mut dyn Player, max_plies: u32) -> GameResult {
-    let mut state = State::new();
+    play_game_from(State::new(), white, black, max_plies)
+}
+
+/// As [`play_game`], but starting from an arbitrary position.
+///
+/// Needed because both players are deterministic: every game from the initial
+/// position between the same two players is the *same game*. Strength testing
+/// therefore has to diversify the opening, which means starting from somewhere
+/// other than `State::new()`.
+///
+/// `plies` counts only moves played by the two players, not those already in
+/// `start`.
+pub fn play_game_from(
+    start: State,
+    white: &mut dyn Player,
+    black: &mut dyn Player,
+    max_plies: u32,
+) -> GameResult {
+    let mut state = start;
     let mut plies = 0u32;
 
     loop {

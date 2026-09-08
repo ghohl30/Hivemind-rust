@@ -30,6 +30,7 @@
 // Internal modules — not part of the stable surface, subject to change.
 pub mod board;
 pub mod coord;
+pub mod eval;
 pub mod game_runner;
 pub mod gen;
 pub mod moves;
@@ -62,13 +63,22 @@ pub use state::{Outcome, State};
 // `search_bounded` is the time-bounded form (UI engine-request #1): the caller
 // supplies the stop predicate, so the engine stays clock-free and therefore
 // safe to compile into the UI's WASM bundle, where `Instant::now()` panics.
-pub use search::{search, search_bounded, SearchStats, TranspositionTable, MATE_SCORE, MATE_THRESHOLD};
+pub use search::{
+    search, search_bounded, search_bounded_with, SearchStats, TranspositionTable, MATE_SCORE,
+    MATE_THRESHOLD,
+};
+
+// Evaluation, behind a trait so two variants can be compared head-to-head.
+// `LegacyEval` is temporary A/B scaffolding — see its doc comment.
+pub use eval::{CurrentEval, Eval, LegacyEval};
 
 // Native-only: wall-clock wrapper around `search_bounded`. Absent on wasm32 by
 // design — see its doc comment.
 #[cfg(not(target_arch = "wasm32"))]
-pub use search::search_timed;
+pub use search::{search_timed, search_timed_with};
 
 // Phase 6: engine-vs-engine game runner
-pub use game_runner::{play_game, GameResult};
+pub use game_runner::{play_game, play_game_from, GameResult};
 pub use player::{FirstMovePlayer, Player, SearchPlayer};
+#[cfg(not(target_arch = "wasm32"))]
+pub use player::TimedSearchPlayer;
