@@ -57,6 +57,58 @@ const NODE_CHECK_MASK: u64 = 1023;
 /// rather than a matter of remembering to check a flag.
 struct Aborted;
 
+/// Maximum ply the killer table indexes. Comfortably above any depth reachable
+/// under a wall-clock budget; deeper plies simply go unrecorded.
+const MAX_KILLER_PLY: usize = 64;
+
+/// Two "killer" moves per ply: quiet moves that caused a beta cutoff in a
+/// sibling position at the same distance from the root.
+///
+/// Standard chess engines order captures first and use killers only for quiet
+/// moves. Hive has **no captures** — every move is quiet — so killers are not a
+/// supplementary heuristic here, they are the main dynamic ordering signal the
+/// engine has, and they apply uniformly to every move.
+///
+/// Boxed at the top-level call rather than living in the recursion, so the
+/// table is shared across the whole search and survives between iterative
+/// deepening iterations, where it is most useful.
+struct Killers {
+    slots: [[Option<Move>; 2]; MAX_KILLER_PLY],
+}
+
+impl Killers {
+    fn new() -> Self {
+        Self {
+            slots: [[None; 2]; MAX_KILLER_PLY],
+        }
+    }
+
+    #[inline]
+    fn get(&self, ply: u32) -> [Option<Move>; 2] {
+        if (ply as usize) < MAX_KILLER_PLY {
+            self.slots[ply as usize]
+        } else {
+            [None, None]
+        }
+    }
+
+    /// Record a cutoff. Shifts slot 0 into slot 1 so the two most recent
+    /// distinct killers are kept; re-recording the same move must not evict the
+    /// other one by duplicating itself into both slots.
+    #[inline]
+    fn record(&mut self, ply: u32, m: Move) {
+        let i = ply as usize;
+        if i >= MAX_KILLER_PLY {
+            return;
+        }
+        if self.slots[i][0] == Some(m) {
+            return;
+        }
+        self.slots[i][1] = self.slots[i][0];
+        self.slots[i][0] = Some(m);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SearchStats {
     pub nodes: u64,
@@ -199,6 +251,9 @@ pub fn search_bounded_with<E: Eval>(
 
     let mut score = 0i32;
     let mut best: Option<Move> = None;
+    // Persists across iterations on purpose: a move that refuted a line at
+    // depth d is very likely to refute it again at depth d+1.
+    let mut killers = Killers::new();
 
     for d in 1..=max_depth {
         // Depth 1 is unconditional so we always have a move to return.
@@ -215,6 +270,7 @@ pub fn search_bounded_with<E: Eval>(
             tt,
             &mut stats,
             &mut *should_stop,
+            &mut killers,
         ) {
             Ok(s) => {
                 score = s;
@@ -321,6 +377,7 @@ fn negamax<E: Eval>(
     tt: &mut TranspositionTable,
     stats: &mut SearchStats,
     should_stop: &mut dyn FnMut(&SearchStats) -> bool,
+    killers: &mut Killers,
 ) -> Result<i32, Aborted> {
     stats.nodes += 1;
 
@@ -391,7 +448,15 @@ fn negamax<E: Eval>(
         _ => None,
     };
 
+    // Killers for this ply: moves that produced a beta cutoff in a sibling
+    // position at the same distance from the root. Tried straight after the TT
+    // move and ahead of the static proximity tiers below, because "this refuted
+    // a sibling a moment ago" is a stronger signal than "this lands near the
+    // enemy queen".
+    let ply_killers = killers.get(ply);
+
     // Classify each non-TT move.
+    let mut killer_moves: SmallVec<[Move; 2]> = SmallVec::new();
     let mut tier1: SmallVec<[Move; 8]> = SmallVec::new();
     let mut tier2: SmallVec<[Move; 8]> = SmallVec::new();
     let mut non_ant: SmallVec<[Move; 32]> = SmallVec::new();
@@ -402,6 +467,13 @@ fn negamax<E: Eval>(
     for (i, &m) in moves.iter().enumerate() {
         // Skip the TT move — it goes first unconditionally.
         if tt_pos == Some(i) {
+            continue;
+        }
+        // A killer only counts if it is actually legal here — the table is
+        // shared across sibling positions, which do not all permit the same
+        // moves.
+        if ply_killers.contains(&Some(m)) {
+            killer_moves.push(m);
             continue;
         }
         if let Move::Slide { piece, to } = m {
@@ -434,6 +506,7 @@ fn negamax<E: Eval>(
     if let Some(pos) = tt_pos {
         ordered.push(moves[pos]);
     }
+    ordered.extend_from_slice(&killer_moves);
     ordered.extend_from_slice(&tier1);
     ordered.extend_from_slice(&tier2);
     ordered.extend_from_slice(&non_ant);
@@ -453,6 +526,7 @@ fn negamax<E: Eval>(
             tt,
             stats,
             &mut *should_stop,
+            killers,
         );
         // Unconditional, and before `?` inspects the result: this is what keeps
         // every apply paired with an unapply at every frame no matter which
@@ -469,6 +543,7 @@ fn negamax<E: Eval>(
         }
         if alpha >= beta {
             stats.beta_cutoffs += 1;
+            killers.record(ply, m);
             break;
         }
     }
@@ -646,6 +721,65 @@ mod tests {
         assert!(stats.nodes > 0);
         assert_eq!(stats.depth, 4, "stats.depth must equal max_depth");
         assert_eq!(s.undo_depth(), undo_depth_before, "search left undo records on the stack");
+    }
+
+    // --- killer moves ---------------------------------------------------
+
+    #[test]
+    fn killer_record_keeps_two_most_recent_distinct() {
+        let mut k = Killers::new();
+        let a = Move::Place { piece: PieceId(0), to: Coord::ORIGIN };
+        let b = Move::Place { piece: PieceId(1), to: Coord::new(1, 0) };
+        let c = Move::Place { piece: PieceId(2), to: Coord::new(2, 0) };
+
+        k.record(3, a);
+        assert_eq!(k.get(3), [Some(a), None]);
+        k.record(3, b);
+        assert_eq!(k.get(3), [Some(b), Some(a)]);
+        k.record(3, c);
+        assert_eq!(k.get(3), [Some(c), Some(b)], "oldest killer is evicted");
+    }
+
+    #[test]
+    fn killer_record_is_idempotent_on_the_top_slot() {
+        // Re-recording the current top killer must not push a copy of itself
+        // into the second slot, which would silently halve the table.
+        let mut k = Killers::new();
+        let a = Move::Place { piece: PieceId(0), to: Coord::ORIGIN };
+        let b = Move::Place { piece: PieceId(1), to: Coord::new(1, 0) };
+
+        k.record(0, b);
+        k.record(0, a);
+        k.record(0, a);
+        assert_eq!(k.get(0), [Some(a), Some(b)]);
+    }
+
+    #[test]
+    fn killers_are_per_ply_and_bounded() {
+        let mut k = Killers::new();
+        let a = Move::Place { piece: PieceId(0), to: Coord::ORIGIN };
+        k.record(2, a);
+        assert_eq!(k.get(2), [Some(a), None]);
+        assert_eq!(k.get(3), [None, None], "killers must not leak across plies");
+
+        // Out-of-range plies are ignored rather than panicking.
+        k.record(MAX_KILLER_PLY as u32 + 5, a);
+        assert_eq!(k.get(MAX_KILLER_PLY as u32 + 5), [None, None]);
+    }
+
+    #[test]
+    fn killer_ordering_still_searches_every_move() {
+        // The killer tier is a reorder, not a filter. If it ever dropped or
+        // duplicated a move the search would silently explore the wrong tree.
+        let mut s = State::new();
+        let mut tt = TranspositionTable::with_capacity_log2(14);
+        let depth_before = s.undo_depth();
+        let (_score, best, stats) = search(&mut s, 3, &mut tt);
+
+        assert!(best.is_some());
+        assert!(s.legal_moves().contains(&best.unwrap()));
+        assert!(stats.nodes > 0);
+        assert_eq!(s.undo_depth(), depth_before);
     }
 
     // --- time-bounded search -------------------------------------------
