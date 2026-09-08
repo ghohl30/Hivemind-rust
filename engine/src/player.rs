@@ -55,6 +55,53 @@ impl Player for SearchPlayer {
 }
 
 // ---------------------------------------------------------------------------
+// TimedSearchPlayer
+// ---------------------------------------------------------------------------
+
+/// Searches under a wall-clock budget rather than to a fixed depth, and is
+/// generic over the evaluation so two evaluations can play each other.
+///
+/// Equal *time* is the only fair way to compare evaluations: a richer
+/// evaluation that reaches the same depth more slowly has not improved
+/// anything, and a fixed-depth comparison would hide exactly that cost.
+///
+/// Native-only, because the budget needs a clock — see `search_timed`.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct TimedSearchPlayer<E: crate::eval::Eval> {
+    pub budget: std::time::Duration,
+    /// Safety ceiling only; the budget is expected to bind first.
+    pub max_depth: u8,
+    pub tt: TranspositionTable,
+    _eval: core::marker::PhantomData<E>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<E: crate::eval::Eval> TimedSearchPlayer<E> {
+    pub fn new(budget: std::time::Duration, tt_log2: u32) -> Self {
+        Self {
+            budget,
+            max_depth: 64,
+            tt: TranspositionTable::with_capacity_log2(tt_log2),
+            _eval: core::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<E: crate::eval::Eval> Player for TimedSearchPlayer<E> {
+    fn choose_move(&mut self, state: &State) -> Move {
+        let mut working = state.clone();
+        let (_score, best, _stats) = crate::search::search_timed_with::<E>(
+            &mut working,
+            self.max_depth,
+            &mut self.tt,
+            self.budget,
+        );
+        best.expect("TimedSearchPlayer: search returned no move for a non-terminal position")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FirstMovePlayer
 // ---------------------------------------------------------------------------
 

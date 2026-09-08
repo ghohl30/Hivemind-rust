@@ -33,6 +33,7 @@
 //!   positive mate  → score  = stored - ply  (reverses the shift)
 //!   negative mate  → score  = stored + ply
 
+use crate::eval::{CurrentEval, Eval};
 use crate::moves::Move;
 use crate::piece::{queen_of, Color, PieceSlot, PieceType};
 use crate::state::{Outcome, State};
@@ -170,6 +171,20 @@ pub fn search_bounded(
     tt: &mut TranspositionTable,
     should_stop: &mut dyn FnMut(&SearchStats) -> bool,
 ) -> (i32, Option<Move>, SearchStats) {
+    search_bounded_with::<CurrentEval>(state, max_depth, tt, should_stop)
+}
+
+/// [`search_bounded`], parameterised on the evaluation function.
+///
+/// Exists so two evaluations can play each other in a single process (see
+/// `examples/gauntlet.rs`). `E` is static-dispatch, so this costs a
+/// monomorphisation rather than a branch at every leaf.
+pub fn search_bounded_with<E: Eval>(
+    state: &mut State,
+    max_depth: u8,
+    tt: &mut TranspositionTable,
+    should_stop: &mut dyn FnMut(&SearchStats) -> bool,
+) -> (i32, Option<Move>, SearchStats) {
     let mut stats = SearchStats::default();
 
     // A forced move needs no deliberation. `depth: 0` truthfully reports that
@@ -191,7 +206,7 @@ pub fn search_bounded(
             break;
         }
 
-        match negamax(
+        match negamax::<E>(
             state,
             d,
             0,
@@ -245,6 +260,18 @@ pub fn search_timed(
     tt: &mut TranspositionTable,
     budget: std::time::Duration,
 ) -> (i32, Option<Move>, SearchStats) {
+    search_timed_with::<CurrentEval>(state, max_depth, tt, budget)
+}
+
+/// [`search_timed`], parameterised on the evaluation function. See
+/// [`search_bounded_with`].
+#[cfg(not(target_arch = "wasm32"))]
+pub fn search_timed_with<E: Eval>(
+    state: &mut State,
+    max_depth: u8,
+    tt: &mut TranspositionTable,
+    budget: std::time::Duration,
+) -> (i32, Option<Move>, SearchStats) {
     use std::time::Instant;
 
     let start = Instant::now();
@@ -271,7 +298,7 @@ pub fn search_timed(
         false
     };
 
-    search_bounded(state, max_depth, tt, &mut should_stop)
+    search_bounded_with::<E>(state, max_depth, tt, &mut should_stop)
 }
 
 /// Cost multiplier from one iterative-deepening iteration to the next, used to
@@ -285,7 +312,7 @@ pub fn search_timed(
 #[cfg(not(target_arch = "wasm32"))]
 const EFFECTIVE_BRANCHING_FACTOR: f32 = 5.0;
 
-fn negamax(
+fn negamax<E: Eval>(
     state: &mut State,
     depth: u8,
     ply: u32,
@@ -309,7 +336,7 @@ fn negamax(
         return Ok(terminal_score(outcome, state.side_to_move(), ply));
     }
     if depth == 0 {
-        return Ok(evaluate(state));
+        return Ok(E::evaluate(state));
     }
 
     let key = state.zobrist();
@@ -417,7 +444,7 @@ fn negamax(
 
     for m in ordered.iter().copied() {
         state.apply(m);
-        let child = negamax(
+        let child = negamax::<E>(
             state,
             depth - 1,
             ply + 1,
@@ -514,38 +541,6 @@ fn terminal_score(outcome: Outcome, side_to_move: Color, ply: u32) -> i32 {
     }
 }
 
-/// Static evaluation, side-to-move perspective.
-///
-/// Hive's loss condition is "queen surrounded". The crude-but-load-bearing
-/// heuristic is the difference in own-queen and opponent-queen neighbour
-/// counts: getting the opponent closer to surrounded is good, getting your
-/// own queen closer to surrounded is bad. A queen still in hand contributes 0
-/// neighbours — it's safe but means the player hasn't started threats yet.
-fn evaluate(state: &State) -> i32 {
-    let stm = state.side_to_move();
-    let opp = stm.other();
-    let own = queen_neighbours(state, stm) as i32;
-    let theirs = queen_neighbours(state, opp) as i32;
-    // Each neighbour ≈ 1/6 of a mate threat. Weight 10 so scores have headroom.
-    (theirs - own) * 10
-}
-
-fn queen_neighbours(state: &State, color: Color) -> u8 {
-    let q = queen_of(color);
-    let coord = match state.piece_slot(q) {
-        PieceSlot::OnBoard { coord, .. } | PieceSlot::Covered { coord, .. } => coord,
-        PieceSlot::InHand => return 0,
-    };
-    let board = state.board();
-    let mut n = 0u8;
-    for nbr in coord.neighbours() {
-        if board.is_occupied(nbr) {
-            n += 1;
-        }
-    }
-    n
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,28 +590,6 @@ mod tests {
             stats.nodes,
             stats.tt_stores
         );
-    }
-
-    #[test]
-    fn evaluation_is_symmetric_at_initial_state() {
-        // Empty board, both queens in hand ⇒ eval is 0.
-        let s = State::new();
-        assert_eq!(evaluate(&s), 0);
-    }
-
-    #[test]
-    fn evaluation_rewards_attacking_opponent_queen() {
-        // Build a position where white has placed pieces next to black's queen.
-        // Side-to-move is whoever it ends up being; we check the sign relative
-        // to that.
-        let mut s = State::new();
-        s.apply(Move::Place { piece: PieceId(0), to: Coord::ORIGIN });           // WQ
-        s.apply(Move::Place { piece: PieceId(11), to: Coord::new(1, 0) });        // BQ
-        s.apply(Move::Place { piece: PieceId(1), to: Coord::new(-1, 0) });        // W beetle
-        s.apply(Move::Place { piece: PieceId(12), to: Coord::new(2, 0) });        // B beetle
-        // Black has 1 neighbour on its queen; white has 1 neighbour on its queen.
-        // Eval should be 0 here (symmetric).
-        assert_eq!(evaluate(&s), 0);
     }
 
     #[test]
