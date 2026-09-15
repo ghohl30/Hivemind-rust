@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Cargo workspace containing the Hive board-game engine and (planned) a playable UI. The workspace exists so engine work and UI work can proceed in parallel under clear ownership without breaking each other.
+A Cargo workspace containing the Hive board-game engine and a playable UI. The workspace exists so engine work and UI work can proceed in parallel without breaking each other.
 
 ```
 Hivemind-rust/                  # workspace root (you are here)
@@ -13,16 +13,9 @@ Hivemind-rust/                  # workspace root (you are here)
   engine/                       # the engine crate — see engine/CLAUDE.md
     Cargo.toml
     src/ tests/ examples/
-  ui/                           # planned; added by the hive-ui agent
+  ui/                           # the UI crate (Trunk/wasm)
   .github/workflows/test.yml    # CI for the whole workspace
 ```
-
-## Ownership
-
-- **`engine/`** is owned by the default engine agent in this session. UI agent never edits files here.
-- **`ui/`** is owned by the `hive-ui` subagent (defined at `~/.claude/agents/hive-ui.md`). Engine agent never edits files here.
-- **Root-level files** — workspace `Cargo.toml`, `Cargo.lock`, `.gitignore`, root `CLAUDE.md`, `.github/workflows/` — are shared. Whichever side touches one of them calls it out in the PR description so the other side knows.
-- Adding `ui/` as a workspace member is the canonical first shared-files PR; the UI agent owns that PR.
 
 ## Commands
 
@@ -42,7 +35,7 @@ For engine-specific architecture, invariants, and performance choices, see `engi
 ## Workflow
 
 - Branch-per-change + PR via `gh pr create`. CI must be green before merge. No direct pushes to `main`.
-- Suggested branch prefixes: `perf/`, `feat/`, `fix/`, `refactor/`, `ci/`, `docs/` for engine work; the UI agent uses the same prefixes scoped under `ui/` (e.g. `ui/feat/board-render`).
+- Suggested branch prefixes: `perf/`, `feat/`, `fix/`, `refactor/`, `ci/`, `docs/` for engine work; the same prefixes scoped under `ui/` for UI work (e.g. `ui/feat/board-render`).
 - Commit message style: specific imperative, end with `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`.
 
 ## Phase status

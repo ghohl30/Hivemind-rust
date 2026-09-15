@@ -81,7 +81,7 @@ Do not build any of these inside this crate without explicit user direction:
 - Hive expansions (Mosquito / Ladybug / Pillbug — reserved enum variants only in `PieceType`)
 - Symmetry canonicalization in the hash key
 - UHP protocol, network play
-- The UI itself (lives in the sibling `ui/` crate, built by the `hive-ui` subagent)
+- The UI itself (lives in the sibling `ui/` crate)
 - The AlphaZero pipeline (planned Phase 8, separate concern)
 
 The plan file at `/Users/gregor30/.claude/plans/hive-engine-project-eventual-charm.md` references the user's original brief.
