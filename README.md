@@ -22,7 +22,8 @@ The engine (`hive-engine`) implements the full base-game ruleset including the q
 | `board` | Flat 64×64 coord-keyed cell array |
 | `gen/` | Legal-move generation per piece type |
 | `rules` | One-Hive, freedom-to-move, Tarjan articulation |
-| `search` | Alpha-beta with transposition table |
+| `search` | Alpha-beta with transposition table; fixed-depth and time-bounded entry points |
+| `eval` | `Eval` trait (static dispatch) and the position evaluation behind it |
 | `perft` | Bulk node counting for correctness checks |
 | `zobrist` | Incremental Zobrist hashing |
 
@@ -43,7 +44,18 @@ cargo run --release --example perft_bench [depth]
 
 # Alpha-beta benchmark
 cargo run --release --example search_bench [depth] [tt_log2]
+
+# Self-play gauntlet: play two evaluations against each other at equal time
+cargo run --release --example gauntlet
 ```
+
+Evaluation changes are judged by gauntlet win rate, not node counts — a change
+can cut nodes and play worse. Hive has no captures, so material is constant and
+essentially all playing strength lives in the evaluation. The gauntlet uses
+randomised openings (two deterministic engines from the initial position play
+the *same game* every time) and colour-swapped pairs, so a colour or opening
+advantage cancels rather than reading as a strength difference. It is a manual
+pre-merge gate, not a CI step: ~180 games takes about 11 minutes on 4 cores.
 
 Debug builds run proptest with more invariants enabled; release builds are faster for benchmarking.
 
