@@ -6,6 +6,9 @@ below lists the workaround the UI will use in the meantime. File them, decide
 what (if anything) is worth adding to the frozen interface, and ignore the rest;
 nothing here gates UI v1.
 
+**Status:** #1 is **delivered** (engine PR #18) and **adopted by the UI**. #2 is
+still open; its workaround stands and is fine.
+
 Context: UI v1 is browser-based (Leptos + the engine compiled into the same WASM
 bundle), single-player human-vs-engine, AI via `search::search` run in a Web
 Worker. The interface check against `engine/src/lib.rs` found the current public
@@ -17,9 +20,38 @@ items below are ergonomics/UX upgrades, not gaps.
 
 ---
 
-## 1. Time-bounded / iterative-deepening search entry point
+## 1. Time-bounded / iterative-deepening search entry point — ✅ DELIVERED
 
-**Request.** An entry point alongside `search::search` that searches under a
+**Delivered** in engine PR #18 as `search_bounded`, in the callback form this
+request recommended:
+
+```rust
+pub fn search_bounded(
+    state: &mut State,
+    max_depth: u8,
+    tt: &mut TranspositionTable,
+    should_stop: &mut dyn FnMut(&SearchStats) -> bool,
+) -> (i32, Option<Move>, SearchStats);
+```
+
+The engine stayed clock-free for exactly the reason given below, and went
+further than asked: the predicate receives `&SearchStats`, so `stats.depth` (the
+last completed iteration) is available as the progress signal this request
+wanted for the thinking indicator. Guarantees: always `Some` for a non-terminal
+position even if the budget is already spent, never a move from a partially
+searched iteration, and `state` left untouched whether aborted or not.
+
+`search_timed` also exists for native callers but is `#[cfg]`-ed out on wasm32
+by design — it would compile and then panic, and a compile error is the better
+failure. The UI must use `search_bounded`.
+
+**Adopted** by the UI: `Difficulty` now carries a `budget_ms` rather than a
+`depth`, driven from `performance.now()` in `ui/src/game/ai.rs`. The original
+request follows, for the record.
+
+---
+
+**Request (original).** An entry point alongside `search::search` that searches under a
 wall-clock deadline rather than a fixed `depth`, returning the best move found so
 far when the deadline expires. Something shaped like:
 
@@ -49,7 +81,11 @@ locked v1 design, so #1 is purely an upgrade path, not a dependency.
 
 ---
 
-## 2. `State::from_moves(&[Move])` replay constructor (and/or `State` serde)
+## 2. `State::from_moves(&[Move])` replay constructor (and/or `State` serde) — still open
+
+Not delivered as of engine PR #23. The workaround below is in place and correct:
+`ui/src/game/session.rs::replay` is isolated behind one function precisely so it
+can be swapped for the engine constructor without touching callers. No rush.
 
 **Request.** A first-class constructor that replays a move list from the initial
 position into a `State`:
@@ -82,7 +118,7 @@ session record regardless, so adopting `from_moves` later is a drop-in swap.
 
 ---
 
-Neither item blocks the MVP. Recommended priority if you pick one up in 5.5:
-**#1** (it converts a raw ply count into a real UX control and is the more
-visible quality win); **#2** is a future-proofing convenience whose workaround is
-trivial and correct.
+Neither item blocked the MVP. The recommended priority was **#1** (it converts a
+raw ply count into a real UX control and is the more visible quality win) — that
+is the one that shipped. **#2** remains a future-proofing convenience whose
+workaround is trivial and correct.

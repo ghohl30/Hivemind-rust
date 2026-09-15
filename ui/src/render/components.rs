@@ -632,12 +632,14 @@ fn maybe_trigger_ai(
     if s.state().side_to_move() == setup.ai {
         ai_thinking.set(true);
         let moves = s.moves().to_vec();
-        let depth = setup.ai_depth();
+        let budget_ms = setup.ai_budget_ms();
         spawn_local(async move {
             // Yield to the browser event loop so "Thinking…" renders before
-            // the synchronous search blocks the WASM thread.
+            // the synchronous search blocks the WASM thread. The search runs on
+            // that same thread, so the tab stays frozen for up to `budget_ms`
+            // until the Web Worker lands (ui/src/game/worker.rs).
             TimeoutFuture::new(50).await;
-            if let Some(m) = compute_ai_move(&moves, depth) {
+            if let Some(m) = compute_ai_move(&moves, budget_ms) {
                 session.update(|s| {
                     let _ = s.push_move(m);
                 });

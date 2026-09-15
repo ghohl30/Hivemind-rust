@@ -209,12 +209,12 @@ fn human_color_resolution() {
 }
 
 #[test]
-fn difficulty_depths_are_distinct_and_ordered() {
-    assert_eq!(Difficulty::Easy.depth(), 2);
-    assert_eq!(Difficulty::Medium.depth(), 4);
-    assert_eq!(Difficulty::Hard.depth(), 6);
-    assert!(Difficulty::Easy.depth() < Difficulty::Medium.depth());
-    assert!(Difficulty::Medium.depth() < Difficulty::Hard.depth());
+fn difficulty_budgets_are_distinct_and_ordered() {
+    assert_eq!(Difficulty::Easy.budget_ms(), 500.0);
+    assert_eq!(Difficulty::Medium.budget_ms(), 3_000.0);
+    assert_eq!(Difficulty::Hard.budget_ms(), 20_000.0);
+    assert!(Difficulty::Easy.budget_ms() < Difficulty::Medium.budget_ms());
+    assert!(Difficulty::Medium.budget_ms() < Difficulty::Hard.budget_ms());
 }
 
 #[test]
@@ -226,7 +226,7 @@ fn config_resolve_assigns_opposite_ai_color() {
     let setup = cfg.resolve(false);
     assert_eq!(setup.human, Color::Black);
     assert_eq!(setup.ai, Color::White);
-    assert_eq!(setup.ai_depth(), 6);
+    assert_eq!(setup.ai_budget_ms(), 20_000.0);
     // AI plays White, so it moves first.
     assert!(setup.ai_moves_first());
 }
@@ -270,7 +270,7 @@ fn default_config_is_human_white_medium() {
 #[test]
 fn worker_request_round_trips_through_json() {
     let session = play_first_legal(5);
-    let req = WorkerRequest::new(session.moves().to_vec(), Difficulty::Hard.depth(), 42);
+    let req = WorkerRequest::new(session.moves().to_vec(), Difficulty::Hard.budget_ms(), 42);
 
     let json = serde_json::to_string(&req).expect("serialize request");
     let back: WorkerRequest = serde_json::from_str(&json).expect("deserialize request");
@@ -326,4 +326,85 @@ fn config_types_serde_round_trip() {
             assert_eq!(cfg, back);
         }
     }
+}
+
+// ---- time-bounded AI search ------------------------------------------------
+
+/// A deterministic stand-in for `performance.now()`: starts at zero and advances
+/// `STEP_MS` on every call. Deterministic so these tests cannot flake on a busy
+/// machine, and so their cost is fixed rather than dependent on how fast the
+/// host happens to be.
+///
+/// **Budget arithmetic matters here.** The engine polls the predicate every 1024
+/// nodes, and each poll advances this clock by one step, so a budget of N steps
+/// aborts after roughly `N * 1024` nodes. These tests run in a debug build where
+/// the engine is an order of magnitude slower than release, so keep N small —
+/// a budget of 1000 steps is ~1M nodes and will appear to hang.
+const STEP_MS: f64 = 1.0;
+
+fn fake_clock() -> impl FnMut() -> f64 {
+    let mut t = 0.0;
+    move || {
+        let now = t;
+        t += STEP_MS;
+        now
+    }
+}
+
+/// Budget covering roughly `polls` predicate checks (~`polls * 1024` nodes).
+fn budget_for(polls: u32) -> f64 {
+    f64::from(polls) * STEP_MS
+}
+
+#[test]
+fn ai_returns_a_legal_move_for_the_position() {
+    let session = play_first_legal(6);
+    let best = compute_ai_move_with_clock(session.moves(), budget_for(8), fake_clock())
+        .expect("non-terminal position must yield a move");
+    assert!(session.state().legal_moves().contains(&best));
+}
+
+#[test]
+fn ai_honours_an_already_spent_budget() {
+    let session = play_first_legal(6);
+    // Budget zero: the predicate is true at the very first poll. The engine
+    // still owes us a completed depth-1 result rather than `None`.
+    let best = compute_ai_move_with_clock(session.moves(), 0.0, fake_clock())
+        .expect("depth 1 always completes, even on an expired budget");
+    assert!(session.state().legal_moves().contains(&best));
+}
+
+#[test]
+fn ai_search_leaves_the_session_record_untouched() {
+    let session = play_first_legal(6);
+    let before = session.moves().to_vec();
+    let _ = compute_ai_move_with_clock(session.moves(), budget_for(4), fake_clock());
+    assert_eq!(session.moves(), before.as_slice());
+}
+
+#[test]
+fn ai_searches_deeper_with_a_larger_budget() {
+    // The claim this whole PR rests on: budget controls strength. Uses the
+    // engine directly to read `stats.depth`, which `compute_ai_move_with_clock`
+    // deliberately does not surface.
+    use hive_engine::{search_bounded, SearchStats, TranspositionTable};
+
+    let session = play_first_legal(6);
+    let depth_for = |budget_ms: f64| -> u8 {
+        let mut state = replay(session.moves());
+        let mut tt = TranspositionTable::with_capacity_log2(18);
+        let mut clock = fake_clock();
+        let start = clock();
+        let mut should_stop = |_: &SearchStats| clock() - start >= budget_ms;
+        let (_score, _best, stats) =
+            search_bounded(&mut state, MAX_DEPTH, &mut tt, &mut should_stop);
+        stats.depth
+    };
+
+    let shallow = depth_for(budget_for(1));
+    let generous = depth_for(budget_for(32));
+    assert!(
+        generous > shallow,
+        "a 32x budget should buy depth: {shallow} -> {generous}"
+    );
 }

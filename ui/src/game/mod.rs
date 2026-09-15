@@ -1,14 +1,17 @@
 //! Engine-facing game core for the Hive UI.
 //!
-//! Pure Rust, no DOM / Leptos / wasm dependencies — fully testable on the native
-//! target (`cargo test -p hive-ui`). The render and interaction layers (later
-//! PRs) build on these types; this PR introduces no rendering.
+//! No DOM or Leptos dependencies — testable on the native target
+//! (`cargo test -p hive-ui`). The one browser touch-point is
+//! [`ai::compute_ai_move`], which reads `performance.now()`; its logic lives in
+//! the clock-free [`ai::compute_ai_move_with_clock`], which is what the tests
+//! drive.
 //!
 //! Pieces:
 //!   - [`session`]  — `Session`: authoritative `Vec<Move>` + derived `State`.
 //!   - [`index`]    — `LegalMoveIndex`: legal moves grouped by mover/destination,
 //!                    plus forced-pass detection, for the interaction layer.
-//!   - [`config`]   — new-game configuration (human color, AI difficulty/depth).
+//!   - [`config`]   — new-game configuration (human color, AI think-time budget).
+//!   - [`ai`]       — time-bounded engine search behind the difficulty presets.
 //!   - [`worker`]   — serde message contract for the future search Web Worker.
 
 pub mod ai;
@@ -17,8 +20,8 @@ pub mod index;
 pub mod session;
 pub mod worker;
 
-pub use ai::compute_ai_move;
-pub use config::{Difficulty, GameSetup, HumanColor, NewGameConfig};
+pub use ai::{compute_ai_move, compute_ai_move_with_clock};
+pub use config::{Difficulty, GameSetup, HumanColor, NewGameConfig, MAX_DEPTH};
 pub use index::LegalMoveIndex;
 pub use session::{replay, IllegalMove, Session};
 pub use worker::{WorkerRequest, WorkerResponse, WorkerSearchStats};

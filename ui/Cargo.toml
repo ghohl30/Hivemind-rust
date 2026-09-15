@@ -22,8 +22,9 @@ hive-engine = { path = "../engine", features = ["serde"] }
 leptos = { version = "0.6", features = ["csr"] }
 
 # WASM <-> JS glue and browser API bindings. Explicit web-sys features for the
-# board's zoom/pan view controls: wheel + pointer events and the element-rect /
-# pointer-capture APIs they read.
+# board's zoom/pan view controls (wheel + pointer events and the element-rect /
+# pointer-capture APIs they read) and for `Window::performance`, which supplies
+# the monotonic clock the engine's `search_bounded` stop predicate is driven by.
 wasm-bindgen = "0.2"
 web-sys = { version = "0.3", features = [
     "Element",
@@ -31,6 +32,8 @@ web-sys = { version = "0.3", features = [
     "WheelEvent",
     "PointerEvent",
     "KeyboardEvent",
+    "Window",
+    "Performance",
 ] }
 
 # Serialization for DTOs / persisted move lists.
