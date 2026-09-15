@@ -47,9 +47,19 @@ For engine-specific architecture, invariants, and performance choices, see `engi
 
 ## Phase status
 
-The engine is at end of Phase 5 (correctness + Zobrist + make-unmake + incremental caches + alpha-beta search + perf pass — perft depth 5 at ~2.26M nodes/sec, ~3.36× the reference TypeScript implementation). **Phase 5.5 (interface freeze for UI parallelization)** is next; this workspace migration is the prep step for it.
+Phases 1–5 are done (correctness + Zobrist + make-unmake + incremental caches + alpha-beta search + perf pass — perft depth 5 at ~2.26M nodes/sec, ~3.36× the reference TypeScript implementation). **Phase 5.5 (interface freeze for UI parallelization) shipped in PR #8** and has held: every engine change since has been purely additive, and the UI has never been broken by one.
 
-Full phase plan and project memory: `/Users/gregor30/.claude/projects/-Users-gregor30-Dev-ClaudeCodeHive/memory/`.
+**Phase 6 (playing strength) is in progress.** Landed so far:
+
+- PR #18 — `search_bounded`, a time-bounded search entry point. Deliberately clock-free: the caller supplies a `should_stop` predicate, because `std::time::Instant` compiles on `wasm32-unknown-unknown` and then panics at runtime, and this crate is compiled into the UI's WASM bundle.
+- PR #19 — `Eval` trait (static dispatch) plus `examples/gauntlet.rs`, a self-play harness with randomised openings and colour-swapped pairs.
+- PRs #20–#23 — evaluation and move ordering: convex owner-agnostic queen-surround, beetle-on-queen, killer moves. Together **61.1% ± 3.7% over 180 games** against the previous evaluation, and depth 6 from 105,879 nodes / 84.6ms to 44,584 / 37.3ms.
+
+**Evaluation changes are gated on gauntlet win rate, not node counts** — Hive has no captures, so material is constant and essentially all strength lives in the evaluation. A change can cut nodes and play worse. Budget ~180 games (two seeds pooled, 100ms/move) for roughly ±3.7% at 1 s.e.; smaller runs mislead (an 80-game run read 55% where 300 games put the same change at 48.5%).
+
+Open engine follow-ups, in rough value order: **repetition detection** (games hit the 300-ply cap and dilute every future gauntlet number), the `killer_moves` slot-ordering bug in `search.rs` (killers are pushed in `moves` order, so killer[1] can precede the more recent killer[0]), deleting the now-beaten `LegacyEval` scaffold, and `examples/match.rs` — its "10 games" are one deterministic game tallied ten times.
+
+Full phase plan and project memory: `~/.claude/projects/-home-gregor-Repos-Hivemind-rust/memory/`.
 
 ## Remote GPU compute (for the planned RL phase)
 

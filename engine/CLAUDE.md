@@ -6,7 +6,7 @@ Path references in this file are **crate-relative** (e.g. `src/state.rs` means `
 
 ## What this is
 
-A Rust engine for the board game **Hive (base game only)**. The build proceeds in strict phases; each phase ends with a passing test suite before the next begins. Phases 1–4 (correctness, Zobrist hashing, make-unmake, incremental caches) are done; Phase 5 (profile-driven optimization) has shipped both the brief's candidates and a follow-up perf pass. Phase 5.5 (interface freeze for UI parallelization) is next.
+A Rust engine for the board game **Hive (base game only)**. The build proceeds in strict phases; each phase ends with a passing test suite before the next begins. Phases 1–4 (correctness, Zobrist hashing, make-unmake, incremental caches) are done; Phase 5 (profile-driven optimization) has shipped both the brief's candidates and a follow-up perf pass. Phase 5.5 (interface freeze for UI parallelization) shipped in PR #8 — the re-exports in `src/lib.rs` are the frozen surface, and the rules for changing them are documented there. Phase 6 (playing strength) is in progress; see the root CLAUDE.md for what has landed and what is still open.
 
 ## Commands
 
