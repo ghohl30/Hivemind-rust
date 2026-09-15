@@ -1,13 +1,13 @@
 //! Web Worker AI protocol — message contract only.
 //!
-//! The future search worker (PR 6) runs `hive_engine::search::search` off the UI
-//! thread. The main thread posts a [`WorkerRequest`] (the game's move list plus
-//! the search depth); the worker replies with a [`WorkerResponse`] carrying the
-//! chosen move and some lightweight stats.
+//! The future search worker runs `hive_engine::search::search_bounded` off the
+//! UI thread. The main thread posts a [`WorkerRequest`] (the game's move list
+//! plus the think-time budget); the worker replies with a [`WorkerResponse`]
+//! carrying the chosen move and some lightweight stats.
 //!
 //! These are plain serde structs so they round-trip through `serde_json` and are
 //! native-testable. No `web-sys` / wasm dependency lives here — the worker glue
-//! that actually `postMessage`s these lands in PR 6.
+//! that actually `postMessage`s these has not been written yet.
 //!
 //! Why the move list rather than a serialized `State`: the move list is the only
 //! portable representation of a game today (the engine's `serde` feature covers
@@ -19,25 +19,28 @@ use hive_engine::Move;
 
 use serde::{Deserialize, Serialize};
 
-/// Main thread → worker: "search this position to this depth."
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Main thread → worker: "search this position within this budget."
+///
+/// `Eq` is not derived: `budget_ms` is an `f64`. Compare with `PartialEq`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkerRequest {
     /// Authoritative game record. The worker replays it from `State::new()` to
     /// reconstruct the position to search.
     pub moves: Vec<Move>,
-    /// Negamax search depth (from the difficulty preset).
-    pub depth: u8,
+    /// Wall-clock think-time budget in milliseconds (from the difficulty
+    /// preset). The worker owns the clock and drives `search_bounded` with it.
+    pub budget_ms: f64,
     /// Opaque id echoed back in the response so the main thread can match a
     /// reply to the request it sent and discard stale ones.
     pub request_id: u64,
 }
 
 impl WorkerRequest {
-    /// Construct a request for the given record and depth.
-    pub fn new(moves: Vec<Move>, depth: u8, request_id: u64) -> Self {
+    /// Construct a request for the given record and think-time budget.
+    pub fn new(moves: Vec<Move>, budget_ms: f64, request_id: u64) -> Self {
         Self {
             moves,
-            depth,
+            budget_ms,
             request_id,
         }
     }

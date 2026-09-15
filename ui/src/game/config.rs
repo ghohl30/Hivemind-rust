@@ -36,17 +36,25 @@ impl HumanColor {
     }
 }
 
-/// AI strength preset. Each maps to a fixed negamax search depth passed to
-/// `hive_engine::search::search`.
+/// Depth ceiling handed to `hive_engine::search::search_bounded`.
 ///
-/// Depths are chosen to stay responsive in a WASM Web Worker while giving a
-/// meaningful strength gradient:
-///   - `Easy`   = depth 2 — shallow, near-instant, beatable by a beginner.
-///   - `Medium` = depth 4 — the engine's own `search_bench` default; a solid
-///     club-level opponent that still returns promptly.
-///   - `Hard`   = depth 6 — noticeably stronger; the upper end we trust to stay
-///     interactive before the engine ships a time-bounded entry point
-///     (engine-request #1), at which point these become a fallback.
+/// The wall-clock budget is the real limit; this only stops iterative deepening
+/// from running past a depth no Hive position reaches inside our longest budget.
+/// It exists so a forced line that searches absurdly fast cannot spin.
+pub const MAX_DEPTH: u8 = 12;
+
+/// AI strength preset. Each maps to a wall-clock think-time budget spent by
+/// `hive_engine::search::search_bounded`, which iteratively deepens until the
+/// budget expires and returns the best move from the last *completed* iteration.
+///
+/// Time, not depth, is the control: Hive's branching factor swings from ~10 in
+/// the opening to 80+ once ants are out, so a fixed depth that returns instantly
+/// on move 3 can take minutes on move 30. Budgets follow the engine's own
+/// recommendation when it shipped the entry point (engine-request #1, PR #18):
+///   - `Easy`   = 0.5 s — near-instant, beatable by a beginner.
+///   - `Medium` = 3 s — a solid club-level opponent that still answers promptly.
+///   - `Hard`   = 20 s — the strongest setting; the engine reaches roughly depth
+///     8 from a midgame position in this budget.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Difficulty {
@@ -56,12 +64,12 @@ pub enum Difficulty {
 }
 
 impl Difficulty {
-    /// The concrete search depth for this preset.
-    pub fn depth(self) -> u8 {
+    /// The think-time budget for this preset, in milliseconds.
+    pub fn budget_ms(self) -> f64 {
         match self {
-            Difficulty::Easy => 2,
-            Difficulty::Medium => 4,
-            Difficulty::Hard => 6,
+            Difficulty::Easy => 500.0,
+            Difficulty::Medium => 3_000.0,
+            Difficulty::Hard => 20_000.0,
         }
     }
 }
@@ -112,9 +120,10 @@ pub struct GameSetup {
 }
 
 impl GameSetup {
-    /// The search depth the AI should use, derived from the difficulty preset.
-    pub fn ai_depth(self) -> u8 {
-        self.difficulty.depth()
+    /// The think-time budget the AI should use, derived from the difficulty
+    /// preset, in milliseconds.
+    pub fn ai_budget_ms(self) -> f64 {
+        self.difficulty.budget_ms()
     }
 
     /// Whether the AI moves first (i.e. it plays White, who always opens).
