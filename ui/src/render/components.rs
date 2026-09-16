@@ -39,7 +39,7 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{PointerEvent, WheelEvent};
 
 use crate::game::{compute_ai_move, GameSetup, LegalMoveIndex, Session, WorkerRequest};
-use crate::render::search_worker;
+use crate::render::search_worker::{self, SearchEvent};
 use crate::render::demo::demo_session;
 use crate::render::hex::{
     axial_to_pixel, client_to_user, fit_viewbox, frontier_coords, hex_polygon_points,
@@ -82,6 +82,9 @@ pub fn App() -> impl IntoView {
     let game_setup = create_rw_signal::<Option<GameSetup>>(None);
     // Blocks player interaction while the engine search task is running.
     let ai_thinking = create_rw_signal(false);
+    // Deepest iteration the current search has completed. `0` = none yet, which
+    // is also what a forced move reports, so it renders as a bare "Thinking…".
+    let ai_depth = create_rw_signal(0u8);
 
     let initial = if START_FROM_DEMO {
         demo_session()
@@ -102,10 +105,11 @@ pub fn App() -> impl IntoView {
         selection.set(None);
         popover.set(None);
         ai_thinking.set(false);
+        ai_depth.set(0);
         game_setup.set(Some(setup));
         // If AI plays White it moves first; kick it off immediately.
         if setup.ai_moves_first() {
-            maybe_trigger_ai(session, setup, ai_thinking);
+            maybe_trigger_ai(session, setup, ai_thinking, ai_depth);
         }
     });
 
@@ -118,6 +122,7 @@ pub fn App() -> impl IntoView {
         session.set(Session::new());
         selection.set(None);
         ai_thinking.set(false);
+        ai_depth.set(0);
     });
 
     view! {
@@ -133,6 +138,7 @@ pub fn App() -> impl IntoView {
                             session=session
                             selection=selection
                             ai_thinking=ai_thinking
+                            ai_depth=ai_depth
                             setup=setup
                             on_new_game=on_new_game
                         />
@@ -148,6 +154,7 @@ pub fn App() -> impl IntoView {
                                 selection=selection
                                 popover=popover
                                 ai_thinking=ai_thinking
+                                ai_depth=ai_depth
                                 setup=setup
                             />
                             <HandPanel
@@ -214,6 +221,7 @@ fn Board(
     selection: RwSignal<Option<Selection>>,
     popover: RwSignal<Option<StackPopover>>,
     ai_thinking: RwSignal<bool>,
+    ai_depth: RwSignal<u8>,
     setup: GameSetup,
 ) -> impl IntoView {
     // Derived, reactive view-models. These re-run whenever the session changes.
@@ -368,7 +376,7 @@ fn Board(
         if popover.get_untracked().is_some() {
             popover.set(None);
         }
-        handle_board_click(session, selection, clicked, setup, ai_thinking);
+        handle_board_click(session, selection, clicked, setup, ai_thinking, ai_depth);
     };
 
     // --- Buttons ---
@@ -629,6 +637,7 @@ fn maybe_trigger_ai(
     session: RwSignal<Session>,
     setup: GameSetup,
     ai_thinking: RwSignal<bool>,
+    ai_depth: RwSignal<u8>,
 ) {
     let s = session.get_untracked();
     if s.is_over() || ai_thinking.get_untracked() {
@@ -639,20 +648,24 @@ fn maybe_trigger_ai(
     }
 
     ai_thinking.set(true);
+    ai_depth.set(0);
     let moves = s.moves().to_vec();
     let budget_ms = setup.ai_budget_ms();
 
     // Preferred path: search in the Worker, keeping this thread free to paint
     // and handle input for the whole think.
     let request = WorkerRequest::new(moves, budget_ms, search_worker::next_request_id());
-    let posted = search_worker::request_search(&request, move |result| match result {
-        Some(response) => finish_ai_turn(session, setup, ai_thinking, response.best_move),
-        None => {
+    let posted = search_worker::request_search(&request, move |event| match event {
+        SearchEvent::Progress(depth) => ai_depth.set(depth),
+        SearchEvent::Done(response) => {
+            finish_ai_turn(session, setup, ai_thinking, ai_depth, response.best_move)
+        }
+        SearchEvent::Failed => {
             // The worker died after accepting the request. It is marked dead,
             // so clearing the flag and asking again takes the fallback path
             // below rather than looping.
             ai_thinking.set(false);
-            maybe_trigger_ai(session, setup, ai_thinking);
+            maybe_trigger_ai(session, setup, ai_thinking, ai_depth);
         }
     });
     if posted {
@@ -665,7 +678,7 @@ fn maybe_trigger_ai(
     spawn_local(async move {
         TimeoutFuture::new(50).await;
         let best = compute_ai_move(&request.moves, budget_ms);
-        finish_ai_turn(session, setup, ai_thinking, best);
+        finish_ai_turn(session, setup, ai_thinking, ai_depth, best);
     });
 }
 
@@ -678,6 +691,7 @@ fn finish_ai_turn(
     session: RwSignal<Session>,
     setup: GameSetup,
     ai_thinking: RwSignal<bool>,
+    ai_depth: RwSignal<u8>,
     best: Option<Move>,
 ) {
     if let Some(m) = best {
@@ -686,10 +700,11 @@ fn finish_ai_turn(
         });
     }
     ai_thinking.set(false);
+    ai_depth.set(0);
 
     let next = session.get_untracked();
     if !next.is_over() && next.state().side_to_move() == setup.ai {
-        maybe_trigger_ai(session, setup, ai_thinking);
+        maybe_trigger_ai(session, setup, ai_thinking, ai_depth);
     }
 }
 
@@ -700,9 +715,10 @@ fn apply_move_and_trigger_ai(
     m: Move,
     setup: GameSetup,
     ai_thinking: RwSignal<bool>,
+    ai_depth: RwSignal<u8>,
 ) {
     apply_move(session, selection, m);
-    maybe_trigger_ai(session, setup, ai_thinking);
+    maybe_trigger_ai(session, setup, ai_thinking, ai_depth);
 }
 
 /// Apply a resolved board click to the signals: select / clear / apply-move.
@@ -714,6 +730,7 @@ fn handle_board_click(
     clicked: Coord,
     setup: GameSetup,
     ai_thinking: RwSignal<bool>,
+    ai_depth: RwSignal<u8>,
 ) {
     // Don't accept moves once the game is over.
     if session.with(|s| s.is_over()) {
@@ -730,7 +747,7 @@ fn handle_board_click(
     let _ = side;
     match decision {
         BoardClick::Apply(m) => {
-            apply_move_and_trigger_ai(session, selection, m, setup, ai_thinking);
+            apply_move_and_trigger_ai(session, selection, m, setup, ai_thinking, ai_depth);
         }
         BoardClick::Select(next) => {
             selection.set(next);
@@ -911,6 +928,7 @@ fn StatusPanel(
     session: RwSignal<Session>,
     selection: RwSignal<Option<Selection>>,
     ai_thinking: RwSignal<bool>,
+    ai_depth: RwSignal<u8>,
     setup: GameSetup,
     on_new_game: Callback<()>,
 ) -> impl IntoView {
@@ -930,7 +948,7 @@ fn StatusPanel(
             && LegalMoveIndex::from_state(session.get().state()).is_forced_pass()
     };
     let on_pass = move |_| {
-        apply_move_and_trigger_ai(session, selection, Move::Pass, setup, ai_thinking);
+        apply_move_and_trigger_ai(session, selection, Move::Pass, setup, ai_thinking, ai_depth);
     };
     let new_game = move |_| on_new_game.call(());
 
@@ -971,7 +989,14 @@ fn StatusPanel(
             }}
             {move || {
                 ai_thinking.get().then(|| {
-                    view! { <span class="status-hint thinking">"Thinking\u{2026}"</span> }
+                    // Depth 0 means no iteration has completed yet (or the move
+                    // was forced); showing "depth 0" would be a lie, so the
+                    // bare label stands in until the first real depth lands.
+                    let label = move || match ai_depth.get() {
+                        0 => "Thinking\u{2026}".to_string(),
+                        d => format!("Thinking\u{2026} depth {d}"),
+                    };
+                    view! { <span class="status-hint thinking">{label}</span> }
                 })
             }}
             <button class="ctrl-btn" on:click=new_game>"New Game"</button>

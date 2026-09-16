@@ -10,7 +10,7 @@
 //! per side is simpler than mirroring the types in JS, and a search that takes
 //! seconds is not going to notice the encoding cost.
 
-use hive_ui::game::{handle_request, WorkerRequest};
+use hive_ui::game::{handle_request_with_progress, WorkerMessage, WorkerRequest};
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -33,15 +33,26 @@ fn main() {
             Err(_) => return,
         };
 
+        // Posted as each depth completes, so the UI can show live progress
+        // instead of an opaque spinner for up to 20 seconds.
+        let progress_scope = post_scope.clone();
+        let request_id = request.request_id;
+        let on_progress = move |depth: u8| {
+            let message = WorkerMessage::Progress { request_id, depth };
+            if let Ok(encoded) = serde_json::to_string(&message) {
+                let _ = progress_scope.post_message(&JsValue::from_str(&encoded));
+            }
+        };
+
         // `performance.now()` is monotonic and high-resolution; `Date::now()` is
         // the universally available fallback. Either is fine — the engine polls
         // the predicate every 1024 nodes, so millisecond resolution is ample.
         let response = match post_scope.performance() {
-            Some(perf) => handle_request(&request, move || perf.now()),
-            None => handle_request(&request, js_sys::Date::now),
+            Some(perf) => handle_request_with_progress(&request, move || perf.now(), on_progress),
+            None => handle_request_with_progress(&request, js_sys::Date::now, on_progress),
         };
 
-        if let Ok(encoded) = serde_json::to_string(&response) {
+        if let Ok(encoded) = serde_json::to_string(&WorkerMessage::Done(response)) {
             let _ = post_scope.post_message(&JsValue::from_str(&encoded));
         }
     });

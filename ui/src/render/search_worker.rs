@@ -28,7 +28,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{ErrorEvent, MessageEvent, Worker};
 
-use crate::game::{WorkerRequest, WorkerResponse};
+use crate::game::{WorkerMessage, WorkerRequest, WorkerResponse};
 
 /// Worker bootstrap in the Trunk `dist/` output.
 ///
@@ -40,9 +40,17 @@ use crate::game::{WorkerRequest, WorkerResponse};
 /// `filehash = false` in `Trunk.toml` is what keeps the two in step.
 const WORKER_URL: &str = "./search_worker_loader.js";
 
-/// `Some(response)` on a reply; `None` if the worker failed and the caller must
-/// run the search itself.
-type ResponseHandler = Box<dyn FnMut(Option<WorkerResponse>)>;
+/// What the caller is told about a search in flight.
+pub enum SearchEvent {
+    /// An iteration completed at this depth. More events will follow.
+    Progress(u8),
+    /// The search finished.
+    Done(WorkerResponse),
+    /// The worker failed after accepting the request; run the search yourself.
+    Failed,
+}
+
+type ResponseHandler = Box<dyn FnMut(SearchEvent)>;
 
 struct Inner {
     worker: Worker,
@@ -69,12 +77,21 @@ thread_local! {
     static WORKER: RefCell<Slot> = const { RefCell::new(Slot::Uninit) };
 }
 
-/// Invoke the outstanding handler, if any, outside any borrow of [`WORKER`] —
-/// the callback re-enters this module (it triggers the next search).
-fn complete_pending(handler: &Rc<RefCell<Option<ResponseHandler>>>, result: Option<WorkerResponse>) {
+/// Deliver a non-terminal event, leaving the handler in place for the next one.
+fn notify_pending(handler: &Rc<RefCell<Option<ResponseHandler>>>, event: SearchEvent) {
+    if let Some(f) = handler.borrow_mut().as_mut() {
+        f(event);
+    }
+}
+
+/// Deliver a terminal event, taking the handler first.
+///
+/// Taken before calling because the callback re-enters this module — it starts
+/// the next search — and leaving the borrow open would panic.
+fn complete_pending(handler: &Rc<RefCell<Option<ResponseHandler>>>, event: SearchEvent) {
     let taken = handler.borrow_mut().take();
     if let Some(mut f) = taken {
-        f(result);
+        f(event);
     }
 }
 
@@ -90,14 +107,22 @@ fn spawn() -> Option<Inner> {
         let Some(payload) = event.data().as_string() else {
             return;
         };
-        let Ok(response) = serde_json::from_str::<WorkerResponse>(&payload) else {
+        let Ok(message) = serde_json::from_str::<WorkerMessage>(&payload) else {
             return;
         };
-        // Drop replies to superseded requests.
-        if response.request_id != *msg_latest.borrow() {
-            return;
+        // Drop anything belonging to a superseded request.
+        match message {
+            WorkerMessage::Progress { request_id, depth } => {
+                if request_id == *msg_latest.borrow() {
+                    notify_pending(&msg_handler, SearchEvent::Progress(depth));
+                }
+            }
+            WorkerMessage::Done(response) => {
+                if response.request_id == *msg_latest.borrow() {
+                    complete_pending(&msg_handler, SearchEvent::Done(response));
+                }
+            }
         }
-        complete_pending(&msg_handler, Some(response));
     });
     worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
 
@@ -108,7 +133,7 @@ fn spawn() -> Option<Inner> {
             // closures, and every later `request_search` now returns false.
             *cell.borrow_mut() = Slot::Dead;
         });
-        complete_pending(&err_handler, None);
+        complete_pending(&err_handler, SearchEvent::Failed);
     });
     worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 
@@ -123,15 +148,15 @@ fn spawn() -> Option<Inner> {
 
 /// Post a search to the worker.
 ///
-/// `on_result` receives `Some(response)` when the reply arrives, or `None` if
-/// the worker failed after accepting the request — in which case the caller
-/// must run the search itself.
+/// `on_event` receives zero or more [`SearchEvent::Progress`] events followed by
+/// exactly one terminal [`SearchEvent::Done`] or [`SearchEvent::Failed`].
 ///
 /// Returns `false` if the request could not be handed over at all, which is the
-/// same signal delivered synchronously. Supersedes any outstanding request.
+/// same signal `Failed` carries, delivered synchronously. Supersedes any
+/// outstanding request.
 pub fn request_search(
     request: &WorkerRequest,
-    on_result: impl FnMut(Option<WorkerResponse>) + 'static,
+    on_event: impl FnMut(SearchEvent) + 'static,
 ) -> bool {
     WORKER.with(|cell| {
         {
@@ -152,7 +177,7 @@ pub fn request_search(
             return false;
         };
         *inner.latest_id.borrow_mut() = request.request_id;
-        *inner.handler.borrow_mut() = Some(Box::new(on_result));
+        *inner.handler.borrow_mut() = Some(Box::new(on_event));
         inner
             .worker
             .post_message(&JsValue::from_str(&payload))
