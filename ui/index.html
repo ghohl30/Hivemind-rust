@@ -4,7 +4,14 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Hive</title>
-    <link data-trunk rel="rust" data-wasm-opt="z" />
+    <link data-trunk rel="rust" data-bin="hive-ui" data-wasm-opt="z" />
+    <!-- Engine search, off the UI thread. Built as its own WASM binary, so the
+         engine is compiled into the bundle twice; that is the cost of not
+         freezing the tab for the length of a think. -->
+    <link data-trunk rel="rust" data-bin="search_worker" data-type="worker" data-wasm-opt="z" />
+    <!-- The bootstrap the Worker is actually constructed from; it initialises
+         the bundle above. See search_worker_loader.js for why it buffers. -->
+    <link data-trunk rel="copy-file" href="search_worker_loader.js" />
     <link data-trunk rel="copy-dir" href="assets" />
     <style>
       /* Parchment skin. Warm paper gradient behind frosted panels; burnt-orange

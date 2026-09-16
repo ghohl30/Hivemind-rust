@@ -38,7 +38,8 @@ use leptos::*;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{PointerEvent, WheelEvent};
 
-use crate::game::{compute_ai_move, GameSetup, LegalMoveIndex, Session};
+use crate::game::{compute_ai_move, GameSetup, LegalMoveIndex, Session, WorkerRequest};
+use crate::render::search_worker;
 use crate::render::demo::demo_session;
 use crate::render::hex::{
     axial_to_pixel, client_to_user, fit_viewbox, frontier_coords, hex_polygon_points,
@@ -96,6 +97,7 @@ pub fn App() -> impl IntoView {
 
     // Called by SetupScreen when the player clicks "Start Game".
     let on_start = Callback::new(move |setup: GameSetup| {
+        search_worker::cancel();
         session.set(Session::new());
         selection.set(None);
         popover.set(None);
@@ -109,6 +111,9 @@ pub fn App() -> impl IntoView {
 
     // "New Game" button returns to the setup screen and resets state.
     let on_new_game = Callback::new(move |_: ()| {
+        // The worker cannot be interrupted, so a search in flight will still
+        // finish. Abandon its reply so it cannot land on the new game.
+        search_worker::cancel();
         game_setup.set(None);
         session.set(Session::new());
         selection.set(None);
@@ -629,29 +634,62 @@ fn maybe_trigger_ai(
     if s.is_over() || ai_thinking.get_untracked() {
         return;
     }
-    if s.state().side_to_move() == setup.ai {
-        ai_thinking.set(true);
-        let moves = s.moves().to_vec();
-        let budget_ms = setup.ai_budget_ms();
-        spawn_local(async move {
-            // Yield to the browser event loop so "Thinking…" renders before
-            // the synchronous search blocks the WASM thread. The search runs on
-            // that same thread, so the tab stays frozen for up to `budget_ms`
-            // until the Web Worker lands (ui/src/game/worker.rs).
-            TimeoutFuture::new(50).await;
-            if let Some(m) = compute_ai_move(&moves, budget_ms) {
-                session.update(|s| {
-                    let _ = s.push_move(m);
-                });
-            }
+    if s.state().side_to_move() != setup.ai {
+        return;
+    }
+
+    ai_thinking.set(true);
+    let moves = s.moves().to_vec();
+    let budget_ms = setup.ai_budget_ms();
+
+    // Preferred path: search in the Worker, keeping this thread free to paint
+    // and handle input for the whole think.
+    let request = WorkerRequest::new(moves, budget_ms, search_worker::next_request_id());
+    let posted = search_worker::request_search(&request, move |result| match result {
+        Some(response) => finish_ai_turn(session, setup, ai_thinking, response.best_move),
+        None => {
+            // The worker died after accepting the request. It is marked dead,
+            // so clearing the flag and asking again takes the fallback path
+            // below rather than looping.
             ai_thinking.set(false);
-            // Edge case: if the human has no moves (forced pass), the AI must
-            // move again after the human passes — check and recurse once more.
-            let s2 = session.get_untracked();
-            if !s2.is_over() && s2.state().side_to_move() == setup.ai {
-                maybe_trigger_ai(session, setup, ai_thinking);
-            }
+            maybe_trigger_ai(session, setup, ai_thinking);
+        }
+    });
+    if posted {
+        return;
+    }
+
+    // Fallback: no Worker available (the browser refused one, or the script is
+    // missing). Search here instead, which freezes the tab for up to
+    // `budget_ms`. Yield first so "Thinking…" paints before the freeze.
+    spawn_local(async move {
+        TimeoutFuture::new(50).await;
+        let best = compute_ai_move(&request.moves, budget_ms);
+        finish_ai_turn(session, setup, ai_thinking, best);
+    });
+}
+
+/// Apply the AI's chosen move and clear the thinking flag.
+///
+/// Recurses if it is somehow the AI's turn again: when the human has no legal
+/// move, the forced pass is applied for them and the AI must move twice in a
+/// row. Shared by the Worker and fallback paths so both handle that identically.
+fn finish_ai_turn(
+    session: RwSignal<Session>,
+    setup: GameSetup,
+    ai_thinking: RwSignal<bool>,
+    best: Option<Move>,
+) {
+    if let Some(m) = best {
+        session.update(|s| {
+            let _ = s.push_move(m);
         });
+    }
+    ai_thinking.set(false);
+
+    let next = session.get_untracked();
+    if !next.is_over() && next.state().side_to_move() == setup.ai {
+        maybe_trigger_ai(session, setup, ai_thinking);
     }
 }
 
