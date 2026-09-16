@@ -1,0 +1,61 @@
+diff --git a/internal/state/pieces.go b/internal/state/pieces.go
+index 1549e9d..0b4b3d1 100644
+--- a/internal/state/pieces.go
++++ b/internal/state/pieces.go
+@@ -142,14 +142,52 @@ func (b *Board) antMoves(srcPos Pos) (poss []Pos) {
+ }
+ 
+ // beetleMoves lists the valid moves for the Beetle located at the given position.
++// beetleGateAllows reports whether a beetle may step from srcPos to tgtPos
++// under Hive's "freedom to move" rule as it applies at height.
++//
++// The two hexes adjacent to both src and tgt form a gate. The beetle can pass
++// only if it can get over at least one of them: it is blocked exactly when
++// both gate stacks are strictly taller than both the level it drops to on the
++// source hex (i.e. after lifting itself off) and the level it climbs to on the
++// target hex.
++func (b *Board) beetleGateAllows(srcPos, tgtPos Pos) bool {
++	srcAfterLeaving := int(b.CountAt(srcPos)) - 1
++	tgtHeight := int(b.CountAt(tgtPos))
++	squeezeFloor := max(srcAfterLeaving, tgtHeight)
++
++	gateHeights := make([]int, 0, 2)
++	for _, n := range srcPos.Neighbours() {
++		for _, m := range tgtPos.Neighbours() {
++			if n == m {
++				gateHeights = append(gateHeights, int(b.CountAt(n)))
++			}
++		}
++	}
++	for _, h := range gateHeights {
++		if h <= squeezeFloor {
++			return true
++		}
++	}
++	return len(gateHeights) < 2
++}
++
+ func (b *Board) beetleMoves(srcPos Pos) (positions []Pos) {
+-	// If on top of a piece, it can move anywhere.
++	// If on top of a piece, it can move to any neighbour it can clear.
+ 	if _, _, stacked := b.PieceAt(srcPos); stacked {
+-		return srcPos.Neighbours()
++		for _, tgtPos := range srcPos.Neighbours() {
++			if b.beetleGateAllows(srcPos, tgtPos) {
++				positions = append(positions, tgtPos)
++			}
++		}
++		return
+ 	}
+ 
+-	// It can move onto any other piece.
+-	positions = b.OccupiedNeighbours(srcPos)
++	// It can climb onto any neighbouring piece it can clear the gate to.
++	for _, tgtPos := range b.OccupiedNeighbours(srcPos) {
++		if b.beetleGateAllows(srcPos, tgtPos) {
++			positions = append(positions, tgtPos)
++		}
++	}
+ 
+ 	// And it moves like the queen: notice that if not moving from the top,
+ 	// it can't squeeze between pieces either.
