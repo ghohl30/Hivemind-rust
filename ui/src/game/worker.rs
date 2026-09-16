@@ -19,7 +19,7 @@ use hive_engine::{Move, SearchStats};
 
 use serde::{Deserialize, Serialize};
 
-use crate::game::ai::search_with_clock;
+use crate::game::ai::search_with_progress;
 
 /// Main thread → worker: "search this position within this budget."
 ///
@@ -98,11 +98,41 @@ pub struct WorkerResponse {
 /// everything worth testing is testable here on the native target — `now_ms` is
 /// the worker's clock, injected for the same reason it is injected in `ai.rs`.
 pub fn handle_request(req: &WorkerRequest, now_ms: impl FnMut() -> f64) -> WorkerResponse {
-    let result = search_with_clock(&req.moves, req.budget_ms, now_ms);
+    handle_request_with_progress(req, now_ms, |_depth| {})
+}
+
+/// [`handle_request`], reporting each completed search depth as it happens.
+///
+/// The worker posts these as [`WorkerMessage::Progress`] so the UI can show a
+/// live depth while it thinks; the final [`WorkerMessage::Done`] carries the
+/// authoritative depth.
+pub fn handle_request_with_progress(
+    req: &WorkerRequest,
+    now_ms: impl FnMut() -> f64,
+    on_progress: impl FnMut(u8),
+) -> WorkerResponse {
+    let result = search_with_progress(&req.moves, req.budget_ms, now_ms, on_progress);
     WorkerResponse {
         request_id: req.request_id,
         best_move: result.best,
         score: result.score,
         stats: result.stats.into(),
     }
+}
+
+/// Worker → main thread. Several `Progress` messages may precede one `Done`.
+///
+/// Tagged rather than two bare structs so the main thread can decode without
+/// guessing, and so adding a third kind later does not break the wire format.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum WorkerMessage {
+    /// An iteration finished; the search continues.
+    Progress {
+        /// Echoes the request, so stale progress is discarded like stale replies.
+        request_id: u64,
+        /// Depth just completed.
+        depth: u8,
+    },
+    /// The search finished. No further messages for this request.
+    Done(WorkerResponse),
 }

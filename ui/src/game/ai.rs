@@ -60,13 +60,41 @@ impl AiSearch {
 pub fn search_with_clock(
     moves: &[Move],
     budget_ms: f64,
+    now_ms: impl FnMut() -> f64,
+) -> AiSearch {
+    search_with_progress(moves, budget_ms, now_ms, |_depth| {})
+}
+
+/// [`search_with_clock`], reporting each completed iterative-deepening
+/// iteration to `on_progress` as it happens.
+///
+/// This is what makes a live "thinking, depth N" indicator possible: the engine
+/// hands `&SearchStats` to the stop predicate precisely so a caller can watch
+/// `stats.depth` change without the engine needing a progress channel.
+///
+/// Two limits worth knowing. The predicate is polled every 1024 nodes, so a
+/// depth is reported at the first poll *after* it completes, not the instant it
+/// does. And the final iteration returns without a further poll, so the deepest
+/// depth usually arrives in [`AiSearch::stats`] rather than through this
+/// callback — treat it as a progress hint, not a record of every depth reached.
+pub fn search_with_progress(
+    moves: &[Move],
+    budget_ms: f64,
     mut now_ms: impl FnMut() -> f64,
+    mut on_progress: impl FnMut(u8),
 ) -> AiSearch {
     let mut state = replay(moves);
     let mut tt = TranspositionTable::with_capacity_log2(TT_LOG2);
 
     let start = now_ms();
-    let mut should_stop = |_stats: &SearchStats| now_ms() - start >= budget_ms;
+    let mut reported = 0u8;
+    let mut should_stop = |stats: &SearchStats| {
+        if stats.depth != reported {
+            reported = stats.depth;
+            on_progress(stats.depth);
+        }
+        now_ms() - start >= budget_ms
+    };
 
     let (score, best, stats) =
         search_bounded(&mut state, MAX_DEPTH, &mut tt, &mut should_stop);

@@ -495,3 +495,89 @@ fn was_forced_distinguishes_a_short_circuit_from_a_real_search() {
     };
     assert!(!terminal.was_forced());
 }
+
+// ---- live search progress --------------------------------------------------
+
+#[test]
+fn progress_reports_completed_depths_in_order() {
+    let session = play_first_legal(6);
+    let seen = std::cell::RefCell::new(Vec::new());
+
+    let result = search_with_progress(
+        session.moves(),
+        budget_for(32),
+        fake_clock(),
+        |depth| seen.borrow_mut().push(depth),
+    );
+
+    let seen = seen.into_inner();
+    assert!(!seen.is_empty(), "a multi-iteration search must report progress");
+    assert!(
+        seen.windows(2).all(|w| w[0] < w[1]),
+        "depths must be strictly increasing, got {seen:?}"
+    );
+    // Progress is a hint: the last iteration returns without a further poll, so
+    // the authoritative depth is in the result and is never behind the hint.
+    assert!(result.stats.depth >= *seen.last().unwrap());
+}
+
+#[test]
+fn an_expired_budget_reports_at_most_the_guaranteed_iteration() {
+    let session = play_first_legal(6);
+    let seen = std::cell::RefCell::new(Vec::new());
+
+    // Budget zero: the predicate is true at the first poll. The engine still
+    // runs depth 1 unconditionally, so that one iteration may be reported —
+    // but nothing deeper, or the indicator would promise a search that never
+    // happened.
+    let result = search_with_progress(session.moves(), 0.0, fake_clock(), |depth| {
+        seen.borrow_mut().push(depth)
+    });
+
+    let seen = seen.into_inner();
+    assert!(seen.is_empty() || seen.as_slice() == [1u8], "got {seen:?}");
+    assert_eq!(result.stats.depth, 1, "depth 1 is the engine's guarantee");
+}
+
+#[test]
+fn handle_request_with_progress_reports_and_still_answers() {
+    let session = play_first_legal(6);
+    let req = WorkerRequest::new(session.moves().to_vec(), budget_for(32), 3);
+    let seen = std::cell::RefCell::new(Vec::new());
+
+    let resp = handle_request_with_progress(&req, fake_clock(), |d| seen.borrow_mut().push(d));
+
+    assert!(!seen.into_inner().is_empty());
+    assert_eq!(resp.request_id, 3);
+    assert!(resp.best_move.is_some());
+}
+
+#[test]
+fn worker_messages_round_trip_through_json() {
+    // Both variants cross the thread boundary as JSON, and the main thread has
+    // to tell them apart without guessing.
+    let progress = WorkerMessage::Progress {
+        request_id: 12,
+        depth: 4,
+    };
+    let json = serde_json::to_string(&progress).unwrap();
+    assert_eq!(
+        serde_json::from_str::<WorkerMessage>(&json).unwrap(),
+        progress
+    );
+
+    let done = WorkerMessage::Done(WorkerResponse {
+        request_id: 12,
+        best_move: None,
+        score: 7,
+        stats: WorkerSearchStats::default(),
+    });
+    let json = serde_json::to_string(&done).unwrap();
+    assert_eq!(serde_json::from_str::<WorkerMessage>(&json).unwrap(), done);
+
+    // A Progress must never decode as a Done, or a live update would be taken
+    // for a final answer and end the turn early.
+    let progress_json = serde_json::to_string(&progress).unwrap();
+    let decoded: WorkerMessage = serde_json::from_str(&progress_json).unwrap();
+    assert!(matches!(decoded, WorkerMessage::Progress { .. }));
+}
