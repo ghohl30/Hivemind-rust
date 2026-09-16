@@ -295,6 +295,7 @@ fn worker_response_round_trips_through_json() {
             tt_cutoffs: 3,
             beta_cutoffs: 7,
             tt_stores: 100,
+            depth: 5,
         },
     };
 
@@ -407,4 +408,90 @@ fn ai_searches_deeper_with_a_larger_budget() {
         generous > shallow,
         "a 32x budget should buy depth: {shallow} -> {generous}"
     );
+}
+
+// ---- worker request handling -----------------------------------------------
+
+#[test]
+fn handle_request_echoes_the_request_id() {
+    let session = play_first_legal(6);
+    let req = WorkerRequest::new(session.moves().to_vec(), budget_for(4), 7);
+    let resp = handle_request(&req, fake_clock());
+    assert_eq!(resp.request_id, 7);
+}
+
+#[test]
+fn handle_request_returns_a_legal_move_and_real_stats() {
+    let session = play_first_legal(6);
+    let req = WorkerRequest::new(session.moves().to_vec(), budget_for(8), 1);
+    let resp = handle_request(&req, fake_clock());
+
+    let best = resp.best_move.expect("non-terminal position must yield a move");
+    assert!(session.state().legal_moves().contains(&best));
+    assert!(resp.stats.nodes > 0, "a real search must visit nodes");
+    assert!(resp.stats.depth >= 1, "at least one iteration must complete");
+}
+
+#[test]
+fn handle_request_response_survives_the_wire() {
+    let session = play_first_legal(6);
+    let req = WorkerRequest::new(session.moves().to_vec(), budget_for(4), 99);
+
+    // The worker posts JSON and the main thread parses it; assert the whole
+    // round trip, since that is what actually crosses the thread boundary.
+    let req_json = serde_json::to_string(&req).unwrap();
+    let decoded: WorkerRequest = serde_json::from_str(&req_json).unwrap();
+    let resp = handle_request(&decoded, fake_clock());
+    let resp_json = serde_json::to_string(&resp).unwrap();
+    let back: WorkerResponse = serde_json::from_str(&resp_json).unwrap();
+
+    assert_eq!(resp, back);
+    assert_eq!(back.request_id, 99);
+}
+
+#[test]
+fn was_forced_distinguishes_a_short_circuit_from_a_real_search() {
+    use hive_engine::SearchStats;
+
+    let some_move = Move::Place {
+        piece: PieceId(0),
+        to: hive_engine::Coord::new(0, 0),
+    };
+
+    // The engine short-circuits a position with exactly one legal move: it
+    // reports `depth: 0` and a placeholder score of 0, neither of which is a
+    // search result. The UI must not render that as an evaluation. (The
+    // short-circuit itself is the engine's behaviour and is tested there; what
+    // is ours is recognising it.)
+    let forced = AiSearch {
+        best: Some(some_move),
+        score: 0,
+        stats: SearchStats {
+            depth: 0,
+            ..Default::default()
+        },
+    };
+    assert!(forced.was_forced());
+
+    // A completed search at any depth is a real result.
+    let searched = AiSearch {
+        best: Some(some_move),
+        score: -42,
+        stats: SearchStats {
+            depth: 1,
+            ..Default::default()
+        },
+    };
+    assert!(!searched.was_forced());
+
+    // A terminal position yields no move at all, which is not a forced move.
+    let terminal = AiSearch {
+        best: None,
+        score: 0,
+        stats: SearchStats {
+            depth: 0,
+            ..Default::default()
+        },
+    };
+    assert!(!terminal.was_forced());
 }

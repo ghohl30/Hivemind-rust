@@ -4,6 +4,11 @@
 [build]
 target = "index.html"
 dist = "dist"
+# The app bundle constructs `new Worker("./search_worker.js")` by name, so the
+# worker's filename has to be predictable. Trunk's hashing is all-or-nothing,
+# hence disabling it wholesale. Cost: no cache-busting on redeploy, so a static
+# host may serve a stale bundle until the browser revalidates.
+filehash = false
 
 [serve]
 port = 8080

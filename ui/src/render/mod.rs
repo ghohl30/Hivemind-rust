@@ -12,6 +12,7 @@
 pub mod demo;
 pub mod hex;
 pub mod interaction;
+pub mod search_worker;
 pub mod setup;
 pub mod view;
 

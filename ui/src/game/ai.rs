@@ -24,31 +24,62 @@ const TT_LOG2: u32 = 18;
 /// needing a clock at all, which is the safe way to degrade.
 const CLOCKLESS_FALLBACK_DEPTH: u8 = 4;
 
+/// A completed search: everything the Web Worker needs to fill a
+/// `WorkerResponse`, and more than the main-thread path reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AiSearch {
+    /// Best move found, or `None` at a terminal position.
+    pub best: Option<Move>,
+    /// Score from the side-to-move's perspective (negamax convention).
+    ///
+    /// Not meaningful when `stats.depth == 0` — see [`AiSearch::was_forced`].
+    pub score: i32,
+    /// Engine statistics, including `depth`: the last *completed* iteration.
+    pub stats: SearchStats,
+}
+
+impl AiSearch {
+    /// Whether the engine short-circuited because the position had exactly one
+    /// legal move. It reports `depth: 0` and a placeholder `score` of 0 in that
+    /// case; neither is a search result and neither should be displayed.
+    pub fn was_forced(&self) -> bool {
+        self.stats.depth == 0 && self.best.is_some()
+    }
+}
+
 /// Reconstruct the game position from `moves`, search it under a `budget_ms`
-/// wall-clock budget measured by `now_ms`, and return the best move (or `None`
-/// at a terminal position).
+/// wall-clock budget measured by `now_ms`, and return the full result.
 ///
 /// `now_ms` must be monotonically non-decreasing; only differences are used, so
 /// its origin is irrelevant. It is polled every 1024 nodes by the engine, not
 /// once per node, so a mildly expensive clock is fine.
 ///
-/// The engine guarantees a `Some` result for any non-terminal position even if
+/// The engine guarantees a `Some` move for any non-terminal position even if
 /// the budget is already spent on entry — depth 1 always completes — and never
 /// returns a move from a partially searched iteration.
-pub fn compute_ai_move_with_clock(
+pub fn search_with_clock(
     moves: &[Move],
     budget_ms: f64,
     mut now_ms: impl FnMut() -> f64,
-) -> Option<Move> {
+) -> AiSearch {
     let mut state = replay(moves);
     let mut tt = TranspositionTable::with_capacity_log2(TT_LOG2);
 
     let start = now_ms();
     let mut should_stop = |_stats: &SearchStats| now_ms() - start >= budget_ms;
 
-    let (_score, best, _stats) =
+    let (score, best, stats) =
         search_bounded(&mut state, MAX_DEPTH, &mut tt, &mut should_stop);
-    best
+    AiSearch { best, score, stats }
+}
+
+/// [`search_with_clock`], keeping only the move.
+pub fn compute_ai_move_with_clock(
+    moves: &[Move],
+    budget_ms: f64,
+    now_ms: impl FnMut() -> f64,
+) -> Option<Move> {
+    search_with_clock(moves, budget_ms, now_ms).best
 }
 
 /// Browser entry point: [`compute_ai_move_with_clock`] driven by

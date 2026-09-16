@@ -34,6 +34,14 @@ web-sys = { version = "0.3", features = [
     "KeyboardEvent",
     "Window",
     "Performance",
+    # Search Web Worker: the main thread's handle plus the worker-side global
+    # scope and the message events crossing between them.
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
+    "DedicatedWorkerGlobalScope",
+    "MessageEvent",
+    "ErrorEvent",
 ] }
 
 # Serialization for DTOs / persisted move lists.

@@ -20,11 +20,11 @@ pub mod index;
 pub mod session;
 pub mod worker;
 
-pub use ai::{compute_ai_move, compute_ai_move_with_clock};
+pub use ai::{compute_ai_move, compute_ai_move_with_clock, search_with_clock, AiSearch};
 pub use config::{Difficulty, GameSetup, HumanColor, NewGameConfig, MAX_DEPTH};
 pub use index::LegalMoveIndex;
 pub use session::{replay, IllegalMove, Session};
-pub use worker::{WorkerRequest, WorkerResponse, WorkerSearchStats};
+pub use worker::{handle_request, WorkerRequest, WorkerResponse, WorkerSearchStats};
 
 #[cfg(test)]
 mod tests;

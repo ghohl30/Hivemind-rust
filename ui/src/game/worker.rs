@@ -15,9 +15,11 @@
 //! position by replaying the moves, exactly as the main thread does. See
 //! `ui/engine-requests.md` #2.
 
-use hive_engine::Move;
+use hive_engine::{Move, SearchStats};
 
 use serde::{Deserialize, Serialize};
+
+use crate::game::ai::search_with_clock;
 
 /// Main thread → worker: "search this position within this budget."
 ///
@@ -56,6 +58,23 @@ pub struct WorkerSearchStats {
     pub tt_cutoffs: u64,
     pub beta_cutoffs: u64,
     pub tt_stores: u64,
+    /// Last *completed* iterative-deepening iteration. `0` means no iteration
+    /// ran: either the position was terminal, or it had exactly one legal move
+    /// and the engine short-circuited. The score is meaningless in that case.
+    pub depth: u8,
+}
+
+impl From<SearchStats> for WorkerSearchStats {
+    fn from(s: SearchStats) -> Self {
+        Self {
+            nodes: s.nodes,
+            tt_hits: s.tt_hits,
+            tt_cutoffs: s.tt_cutoffs,
+            beta_cutoffs: s.beta_cutoffs,
+            tt_stores: s.tt_stores,
+            depth: s.depth,
+        }
+    }
 }
 
 /// Worker → main thread: the search result.
@@ -70,4 +89,20 @@ pub struct WorkerResponse {
     pub score: i32,
     /// Search statistics.
     pub stats: WorkerSearchStats,
+}
+
+/// Run the search a [`WorkerRequest`] asks for and build its [`WorkerResponse`].
+///
+/// This is the whole of the worker's behaviour. The worker binary
+/// (`src/bin/search_worker.rs`) is only the `postMessage` plumbing around it, so
+/// everything worth testing is testable here on the native target — `now_ms` is
+/// the worker's clock, injected for the same reason it is injected in `ai.rs`.
+pub fn handle_request(req: &WorkerRequest, now_ms: impl FnMut() -> f64) -> WorkerResponse {
+    let result = search_with_clock(&req.moves, req.budget_ms, now_ms);
+    WorkerResponse {
+        request_id: req.request_id,
+        best_move: result.best,
+        score: result.score,
+        stats: result.stats.into(),
+    }
 }
