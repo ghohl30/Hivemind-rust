@@ -118,7 +118,37 @@ cd /tmp/hiveGo && go build -tags gomlx -o hivebridge-gomlx ./cmd/hivebridge
 On first run this downloads XLA's CPU PJRT plugin (~66 MB) to `~/.cache/go-xla`
 and installs it to `~/.local/lib/go-xla`.
 
-## Results — 2026-09-16
+## Results — 2026-09-17, 3 s/move
+
+hiveGo's own default time control. 100 games per opponent, 3 s/move for both
+sides, 4 random opening plies, colours swapped every game, 100-ply draw cap,
+seed 1. Every ply of every game passed the move-generator cross-check.
+
+| hiveGo opponent | hive-engine | hiveGo | draws | score | Elo |
+|---|---|---|---|---|---|
+| `linear,ab` | 62 (35 1st / 27 2nd) | 20 | 18 | **71.0% ± 4.0%** | +155 |
+| `fnn=#0,ab` | 72 (41 1st / 31 2nd) | 15 | 13 | **78.5% ± 3.7%** | +225 |
+| `a0fnn=#0,mcts` | 57 (30 1st / 27 2nd) | 22 | 21 | **67.5% ± 4.1%** | +127 |
+
+All three are 4–8 standard errors above 50%, so hive-engine is clearly stronger
+than every player hiveGo ships. Seat splits stay near-even.
+
+**Thirty times the clock narrowed every margin**, by 7.5–15.5 points versus the
+100 ms run below — so the short control was flattering us, and not only against
+the neural players. Read the 3 s numbers as the honest ones.
+
+**We convert time poorly.** 30× the budget bought ~1.6 extra plies (3.3–4.0 →
+5.2–5.6) on 30× the nodes (~21k → ~650k per move). That is what a large
+branching factor costs, and it is an argument for move-ordering and reduction
+work over further evaluation tuning: an opponent that searches better will gain
+more from a long control than we do.
+
+**Draw structure shifted.** Repetition draws fell (16 → 12 of the total) but
+cap draws rose (23 → 21, and 15 of a0fnn's 21 draws alone), because at 3 s both
+sides are strong enough to grind out long balanced games. A higher cap would
+resolve some of those and is worth a follow-up run.
+
+## Results — 2026-09-16, 100 ms/move
 
 100 games per opponent, 100 ms/move for both sides, 4 random opening plies,
 colours swapped every game, hiveGo's default 100-ply draw cap, seed 1. Every
@@ -130,12 +160,9 @@ ply of every game passed the move-generator cross-check.
 | `fnn=#0,ab` — pretrained neural eval | 84 (45 1st / 39 2nd) | 2 | 14 | **91.0%** |
 | `a0fnn=#0,mcts` — AlphaZero net + MCTS | 66 (37 1st / 29 2nd) | 16 | 18 | **75.0%** |
 
-At 100 games one standard error is roughly ±5%, so all three margins are far
-outside the noise. The seat splits are near-even, so this is not first-player
-advantage. hive-engine reached depth 3.3–4.0 on ~18–23k nodes per move.
-
-AlphaZero+MCTS is clearly their strongest player and the only one to take a
-double-digit share of games.
+Superseded by the 3 s run above, which is the fairer control. Kept for the
+time-scaling comparison. hive-engine reached depth 3.3–4.0 on ~18–23k nodes
+per move.
 
 **Draws are where our known gaps show up.** Across the three matches, 16 of the
 49 draws were threefold repetition — half-points dropped because our search has
