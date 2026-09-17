@@ -24,11 +24,22 @@
 //! request is completed with `None` on `onerror`, and that channel's worker is
 //! marked dead so later searches skip it entirely.
 //!
-//! **Stale replies.** The worker cannot be interrupted mid-search, so a "New
-//! Game" pressed while it is thinking still gets the old reply eventually.
-//! Every request carries a `request_id` and only the most recently issued one
-//! is honoured; anything else is dropped. [`cancel`] invalidates the
-//! outstanding request without waiting for it.
+//! **Cancellation terminates the worker.** A running search cannot be asked to
+//! stop — the engine blocks its worker's thread until its own budget expires —
+//! so `terminate()` is the only real interrupt available, and [`cancel`] uses
+//! it. Anything less only hides the reply: the abandoned search keeps running,
+//! and the *next* request sits in that worker's queue behind it. That is
+//! survivable when cancelling is rare (a "New Game" mid-think) and not at all
+//! survivable for analysis, where every move the player makes cancels a ponder
+//! that may have 25 seconds left to run.
+//!
+//! The cost is that the next request on that channel re-spawns and re-
+//! instantiates the WASM module. That is why `cancel` is called only when a
+//! search is genuinely obsolete, and never between ordinary moves.
+//!
+//! **Stale replies.** Superseding a request without cancelling (posting a new
+//! one over the top) leaves the old search running, so every request carries a
+//! `request_id` and only the most recently issued one is honoured.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -217,20 +228,26 @@ pub fn request_search(
     })
 }
 
-/// Abandon the request outstanding on `channel`. Its reply, whenever it lands,
-/// is ignored.
+/// Stop the search running on `channel` and discard its worker.
 ///
-/// The search itself keeps running to completion inside the worker: it cannot
-/// be interrupted. This only guarantees it will not touch the new position.
+/// This really does stop it: `terminate()` kills the thread mid-search, which
+/// is the only way to interrupt a blocking engine search. Merely dropping the
+/// reply would leave the abandoned search occupying the worker for the rest of
+/// its budget, and the next request queued behind it — for a 30 s analysis
+/// budget that is half a minute of dead panel after every move.
+///
+/// The slot returns to `Uninit`, so the next request on this channel spawns a
+/// fresh worker. A `Dead` channel stays dead: it failed to load, and retrying
+/// costs a stalled turn every time.
 pub fn cancel(channel: Channel) {
-    let id = next_request_id();
     with_slot(channel, |cell| {
-        if let Slot::Live(inner) = &*cell.borrow() {
-            *inner.handler.borrow_mut() = None;
-            // Burn a fresh id from the same counter as real requests: that is
-            // what guarantees nothing in flight — and nothing issued later —
-            // can collide with it.
-            *inner.latest_id.borrow_mut() = id;
+        let mut slot = cell.borrow_mut();
+        match std::mem::replace(&mut *slot, Slot::Uninit) {
+            // Dropping `Inner` afterwards detaches the JS event handlers, so no
+            // late message can reach a handler that no longer applies.
+            Slot::Live(inner) => inner.worker.terminate(),
+            Slot::Dead => *slot = Slot::Dead,
+            Slot::Uninit => {}
         }
     });
 }
