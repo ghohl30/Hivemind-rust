@@ -169,11 +169,19 @@
            view controls. */
         position: relative;
       }
+      /* Fill the panel explicitly. `width/height: auto` does NOT stretch an
+         absolutely-positioned *replaced* element to its inset box — an SVG with
+         a viewBox keeps its intrinsic (square) size instead, so in a panel
+         shorter than it is wide the board overflowed, got clipped by the
+         panel's `overflow: hidden`, and the cells below the fold could not be
+         clicked at all. `preserveAspectRatio="xMidYMid meet"` already letterboxes
+         the drawing, so handing the element the real box is safe and is what
+         makes the board responsive to a short panel. */
       .board-svg {
         position: absolute;
         inset: 0.5rem;
-        width: auto;
-        height: auto;
+        width: calc(100% - 1rem);
+        height: calc(100% - 1rem);
         display: block;
         touch-action: none; /* let pointer-drag pan instead of scrolling */
         cursor: grab;
@@ -439,6 +447,27 @@
       @media (min-width: 800px) {
         .board { flex: 2 1 480px; }
         .hand { flex: 0 0 220px; }
+      }
+
+      /* Narrow screens stack hand / board / hand. As a wrapping *row* the three
+         lines split the leftover height between them (`align-content: stretch`),
+         which left the board a ~130px slit on a phone — unplayable. A column
+         with explicit sizing gives the hands their content height, capped, and
+         hands the rest to the board. */
+      @media (max-width: 799px) {
+        .play-area {
+          flex-direction: column;
+          flex-wrap: nowrap;
+        }
+        .hand {
+          flex: 0 0 auto;
+          max-height: 16dvh;
+          overflow-y: auto;
+        }
+        .board {
+          flex: 1 1 auto;
+          min-height: 240px;
+        }
       }
 
       /* New-game setup screen */
