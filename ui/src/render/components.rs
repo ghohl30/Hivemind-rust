@@ -11,6 +11,12 @@
 //! `spawn_local` after every human move; a 50 ms yield lets the "Thinking…"
 //! indicator render before the synchronous engine search runs.
 //!
+//! With analysis enabled, the human's thinking time is spent *pondering*: a
+//! search on a second Worker (see [`search_worker::Channel`]) that looks for a
+//! forced win in the position on the board. It is advisory — its move is
+//! discarded, only its verdict is shown — and it is cancelled the moment the
+//! human moves, along with the verdict it produced.
+//!
 //! Structure:
 //!   `App`         — owns the session, selection, game-setup, and ai-thinking
 //!                   signals; renders a setup screen or the game board.
@@ -22,7 +28,10 @@
 //!   `FrontierCell`— faint empty-cell outline (also a click target so clicking
 //!                   an empty legal landing spot applies the move).
 //!   `StatusPanel` — whose turn, turn number, placements, queen hint, outcome,
-//!                   forced-`Pass` affordance, "Thinking…" indicator, "New Game".
+//!                   forced-`Pass` affordance, "Thinking…" indicator, the
+//!                   analysis toggle, "New Game".
+//!   `AnalysisPanel`— what the engine has proven about the position, shown
+//!                   only while the analysis toggle is on.
 //!   `HandPanel`   — one color's in-hand pieces; the side-to-move's chips are
 //!                   clickable and show a selected state.
 //!
@@ -38,8 +47,11 @@ use leptos::*;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{PointerEvent, WheelEvent};
 
-use crate::game::{compute_ai_move, GameSetup, LegalMoveIndex, Session, WorkerRequest};
-use crate::render::search_worker::{self, SearchEvent};
+use crate::game::{
+    compute_ai_move, Assessment, GameSetup, LegalMoveIndex, Session, WorkerRequest,
+    ANALYSIS_BUDGET_MS,
+};
+use crate::render::search_worker::{self, Channel, SearchEvent};
 use crate::render::demo::demo_session;
 use crate::render::hex::{
     axial_to_pixel, client_to_user, fit_viewbox, frontier_coords, hex_polygon_points,
@@ -80,11 +92,7 @@ const START_FROM_DEMO: bool = false;
 pub fn App() -> impl IntoView {
     // `None` = show setup screen; `Some(setup)` = game in progress.
     let game_setup = create_rw_signal::<Option<GameSetup>>(None);
-    // Blocks player interaction while the engine search task is running.
-    let ai_thinking = create_rw_signal(false);
-    // Deepest iteration the current search has completed. `0` = none yet, which
-    // is also what a forced move reports, so it renders as a bare "Thinking…".
-    let ai_depth = create_rw_signal(0u8);
+    let ai = AiSignals::new();
 
     let initial = if START_FROM_DEMO {
         demo_session()
@@ -100,29 +108,32 @@ pub fn App() -> impl IntoView {
 
     // Called by SetupScreen when the player clicks "Start Game".
     let on_start = Callback::new(move |setup: GameSetup| {
-        search_worker::cancel();
+        search_worker::cancel(Channel::Move);
+        stop_ponder(ai);
         session.set(Session::new());
         selection.set(None);
         popover.set(None);
-        ai_thinking.set(false);
-        ai_depth.set(0);
+        ai.reset();
         game_setup.set(Some(setup));
-        // If AI plays White it moves first; kick it off immediately.
+        // If AI plays White it moves first; kick it off immediately. Otherwise
+        // the human is on move, which is when pondering runs.
         if setup.ai_moves_first() {
-            maybe_trigger_ai(session, setup, ai_thinking, ai_depth);
+            maybe_trigger_ai(session, setup, ai);
+        } else {
+            maybe_start_ponder(session, setup, ai);
         }
     });
 
     // "New Game" button returns to the setup screen and resets state.
     let on_new_game = Callback::new(move |_: ()| {
-        // The worker cannot be interrupted, so a search in flight will still
-        // finish. Abandon its reply so it cannot land on the new game.
-        search_worker::cancel();
+        // Neither worker can be interrupted, so searches in flight will still
+        // finish. Abandon their replies so they cannot land on the new game.
+        search_worker::cancel(Channel::Move);
+        stop_ponder(ai);
         game_setup.set(None);
         session.set(Session::new());
         selection.set(None);
-        ai_thinking.set(false);
-        ai_depth.set(0);
+        ai.reset();
     });
 
     view! {
@@ -137,11 +148,15 @@ pub fn App() -> impl IntoView {
                         <StatusPanel
                             session=session
                             selection=selection
-                            ai_thinking=ai_thinking
-                            ai_depth=ai_depth
+                            ai=ai
                             setup=setup
                             on_new_game=on_new_game
                         />
+                        {move || {
+                            ai.analysis_on
+                                .get()
+                                .then(|| view! { <AnalysisPanel ai=ai setup=setup /> })
+                        }}
                         <div class="play-area">
                             <HandPanel
                                 color=Color::White
@@ -153,8 +168,7 @@ pub fn App() -> impl IntoView {
                                 session=session
                                 selection=selection
                                 popover=popover
-                                ai_thinking=ai_thinking
-                                ai_depth=ai_depth
+                                ai=ai
                                 setup=setup
                             />
                             <HandPanel
@@ -220,8 +234,7 @@ fn Board(
     session: RwSignal<Session>,
     selection: RwSignal<Option<Selection>>,
     popover: RwSignal<Option<StackPopover>>,
-    ai_thinking: RwSignal<bool>,
-    ai_depth: RwSignal<u8>,
+    ai: AiSignals,
     setup: GameSetup,
 ) -> impl IntoView {
     // Derived, reactive view-models. These re-run whenever the session changes.
@@ -362,7 +375,7 @@ fn Board(
             return;
         }
         // Don't resolve clicks while the engine is searching.
-        if ai_thinking.get_untracked() {
+        if ai.thinking.get_untracked() {
             return;
         }
         let (left, top, w, h) = svg_size();
@@ -376,7 +389,7 @@ fn Board(
         if popover.get_untracked().is_some() {
             popover.set(None);
         }
-        handle_board_click(session, selection, clicked, setup, ai_thinking, ai_depth);
+        handle_board_click(session, selection, clicked, setup, ai);
     };
 
     // --- Buttons ---
@@ -631,41 +644,99 @@ fn StackPopoverBox(
     }
 }
 
+/// Every signal the engine side of the UI writes to, in one `Copy` bundle.
+///
+/// Grouped rather than passed individually because the AI call chain
+/// (`handle_board_click` → `apply_move_and_trigger_ai` → `maybe_trigger_ai` →
+/// `finish_ai_turn`) threads all of them through every hop; as separate
+/// parameters that is six extra arguments at each step.
+#[derive(Clone, Copy)]
+struct AiSignals {
+    /// True while the AI's move search is running. Blocks board input.
+    thinking: RwSignal<bool>,
+    /// Deepest iteration the move search has completed. `0` = none yet, which
+    /// is also what a forced move reports, so it renders as a bare "Thinking…".
+    depth: RwSignal<u8>,
+    /// The analysis toggle. Off by default: it is an assistant, and pondering
+    /// costs a CPU core.
+    analysis_on: RwSignal<bool>,
+    /// The ponder's verdict on the position currently on the board. Cleared as
+    /// soon as a move changes that position, so it can never describe a
+    /// position the player is no longer looking at.
+    analysis: RwSignal<Option<Assessment>>,
+    /// Deepest iteration the ponder has completed. Separate from `depth`, which
+    /// belongs to the AI's move search and drives the status bar.
+    ponder_depth: RwSignal<u8>,
+    /// True while a pondering search is in flight on the analysis worker.
+    pondering: RwSignal<bool>,
+    /// Cleared if the analysis worker fails. Analysis then stays off for the
+    /// rest of the session; the game itself is unaffected.
+    analysis_ok: RwSignal<bool>,
+}
+
+impl AiSignals {
+    fn new() -> Self {
+        Self {
+            thinking: create_rw_signal(false),
+            depth: create_rw_signal(0u8),
+            analysis_on: create_rw_signal(false),
+            analysis: create_rw_signal(None),
+            ponder_depth: create_rw_signal(0u8),
+            pondering: create_rw_signal(false),
+            analysis_ok: create_rw_signal(true),
+        }
+    }
+
+    /// Clear per-game state. Deliberately leaves `analysis_on` and
+    /// `analysis_ok` alone: the toggle is a player preference that should
+    /// survive "New Game", and a dead worker stays dead.
+    fn reset(&self) {
+        self.thinking.set(false);
+        self.depth.set(0);
+        self.pondering.set(false);
+        self.clear_analysis();
+    }
+
+    /// Forget the current verdict. Called whenever the position changes: a
+    /// proof about the previous position is not a proof about this one.
+    fn clear_analysis(&self) {
+        self.analysis.set(None);
+        self.ponder_depth.set(0);
+    }
+}
+
 /// Trigger an AI search if it's the AI's turn and the game is not over.
 /// No-op if already thinking or game has ended. Safe to call speculatively.
-fn maybe_trigger_ai(
-    session: RwSignal<Session>,
-    setup: GameSetup,
-    ai_thinking: RwSignal<bool>,
-    ai_depth: RwSignal<u8>,
-) {
+fn maybe_trigger_ai(session: RwSignal<Session>, setup: GameSetup, ai: AiSignals) {
     let s = session.get_untracked();
-    if s.is_over() || ai_thinking.get_untracked() {
+    if s.is_over() || ai.thinking.get_untracked() {
         return;
     }
     if s.state().side_to_move() != setup.ai {
         return;
     }
 
-    ai_thinking.set(true);
-    ai_depth.set(0);
+    ai.thinking.set(true);
+    ai.depth.set(0);
     let moves = s.moves().to_vec();
     let budget_ms = setup.ai_budget_ms();
 
     // Preferred path: search in the Worker, keeping this thread free to paint
     // and handle input for the whole think.
     let request = WorkerRequest::new(moves, budget_ms, search_worker::next_request_id());
-    let posted = search_worker::request_search(&request, move |event| match event {
-        SearchEvent::Progress(depth) => ai_depth.set(depth),
-        SearchEvent::Done(response) => {
-            finish_ai_turn(session, setup, ai_thinking, ai_depth, response.best_move)
-        }
+    let posted = search_worker::request_search(Channel::Move, &request, move |event| match event {
+        SearchEvent::Progress(depth) => ai.depth.set(depth),
+        // The AI's search deliberately feeds no verdict: it is about the
+        // position *before* its own move, and it is about to move. Anything it
+        // proved, the ponder that starts a moment later proves again about the
+        // position the player is actually looking at.
+        SearchEvent::Done(response) => finish_ai_turn(session, setup, ai, response.best_move),
         SearchEvent::Failed => {
             // The worker died after accepting the request. It is marked dead,
             // so clearing the flag and asking again takes the fallback path
             // below rather than looping.
-            ai_thinking.set(false);
-            maybe_trigger_ai(session, setup, ai_thinking, ai_depth);
+            ai.thinking.set(false);
+            maybe_trigger_ai(session, setup, ai);
         }
     });
     if posted {
@@ -678,8 +749,74 @@ fn maybe_trigger_ai(
     spawn_local(async move {
         TimeoutFuture::new(50).await;
         let best = compute_ai_move(&request.moves, budget_ms);
-        finish_ai_turn(session, setup, ai_thinking, ai_depth, best);
+        finish_ai_turn(session, setup, ai, best);
     });
+}
+
+/// Start a pondering search on the analysis worker if analysis is on and the
+/// human is on move. No-op otherwise, so it is safe to call speculatively.
+///
+/// The move it finds is thrown away — only its verdict is displayed. The point
+/// is that the engine spends the human's thinking time looking for a forced win
+/// in the position actually on the board, rather than sitting idle.
+fn maybe_start_ponder(session: RwSignal<Session>, setup: GameSetup, ai: AiSignals) {
+    if !ai.analysis_on.get_untracked() || !ai.analysis_ok.get_untracked() {
+        return;
+    }
+    // While the AI thinks, its own search feeds the panel; and a ponder already
+    // in flight is for this same position, since a move cancels it.
+    if ai.thinking.get_untracked() || ai.pondering.get_untracked() {
+        return;
+    }
+    let s = session.get_untracked();
+    if s.is_over() || s.state().side_to_move() != setup.human {
+        return;
+    }
+
+    let request = WorkerRequest::new(
+        s.moves().to_vec(),
+        ANALYSIS_BUDGET_MS,
+        search_worker::next_request_id(),
+    );
+    ai.pondering.set(true);
+    let posted =
+        search_worker::request_search(Channel::Analysis, &request, move |event| match event {
+            SearchEvent::Progress(depth) => ai.ponder_depth.set(depth),
+            SearchEvent::Done(response) => {
+                // The verdict comes from the completed search only. A forced
+                // win arrives here promptly regardless: the engine stops
+                // deepening the moment it proves one.
+                ai.analysis.set(Assessment::from_search(
+                    response.score,
+                    setup.human,
+                    response.stats.depth,
+                ));
+                ai.ponder_depth.set(response.stats.depth);
+                ai.pondering.set(false);
+            }
+            SearchEvent::Failed => {
+                ai.pondering.set(false);
+                ai.analysis_ok.set(false);
+            }
+        });
+    if !posted {
+        // No analysis worker. There is deliberately no main-thread fallback
+        // here: a 30 s synchronous search would freeze the tab, which is a far
+        // worse trade than going without an evaluation.
+        ai.pondering.set(false);
+        ai.analysis_ok.set(false);
+    }
+}
+
+/// Abandon the ponder in flight, if any. Its reply is ignored when it lands.
+///
+/// Called whenever the position is about to change or the panel is going away.
+/// The search keeps running inside its worker until its budget expires — it
+/// cannot be interrupted — but it can no longer touch the UI.
+fn stop_ponder(ai: AiSignals) {
+    search_worker::cancel(Channel::Analysis);
+    ai.pondering.set(false);
+    ai.clear_analysis();
 }
 
 /// Apply the AI's chosen move and clear the thinking flag.
@@ -690,8 +827,7 @@ fn maybe_trigger_ai(
 fn finish_ai_turn(
     session: RwSignal<Session>,
     setup: GameSetup,
-    ai_thinking: RwSignal<bool>,
-    ai_depth: RwSignal<u8>,
+    ai: AiSignals,
     best: Option<Move>,
 ) {
     if let Some(m) = best {
@@ -699,12 +835,16 @@ fn finish_ai_turn(
             let _ = s.push_move(m);
         });
     }
-    ai_thinking.set(false);
-    ai_depth.set(0);
+    ai.thinking.set(false);
+    ai.depth.set(0);
 
     let next = session.get_untracked();
     if !next.is_over() && next.state().side_to_move() == setup.ai {
-        maybe_trigger_ai(session, setup, ai_thinking, ai_depth);
+        maybe_trigger_ai(session, setup, ai);
+    } else {
+        // Control is back with the human (or the game is over, which this
+        // no-ops on): their thinking time is the engine's analysis time.
+        maybe_start_ponder(session, setup, ai);
     }
 }
 
@@ -714,11 +854,13 @@ fn apply_move_and_trigger_ai(
     selection: RwSignal<Option<Selection>>,
     m: Move,
     setup: GameSetup,
-    ai_thinking: RwSignal<bool>,
-    ai_depth: RwSignal<u8>,
+    ai: AiSignals,
 ) {
+    // The position is about to change, so any ponder in flight is analysing a
+    // position that no longer exists.
+    stop_ponder(ai);
     apply_move(session, selection, m);
-    maybe_trigger_ai(session, setup, ai_thinking, ai_depth);
+    maybe_trigger_ai(session, setup, ai);
 }
 
 /// Apply a resolved board click to the signals: select / clear / apply-move.
@@ -729,8 +871,7 @@ fn handle_board_click(
     selection: RwSignal<Option<Selection>>,
     clicked: Coord,
     setup: GameSetup,
-    ai_thinking: RwSignal<bool>,
-    ai_depth: RwSignal<u8>,
+    ai: AiSignals,
 ) {
     // Don't accept moves once the game is over.
     if session.with(|s| s.is_over()) {
@@ -747,7 +888,7 @@ fn handle_board_click(
     let _ = side;
     match decision {
         BoardClick::Apply(m) => {
-            apply_move_and_trigger_ai(session, selection, m, setup, ai_thinking, ai_depth);
+            apply_move_and_trigger_ai(session, selection, m, setup, ai);
         }
         BoardClick::Select(next) => {
             selection.set(next);
@@ -922,13 +1063,13 @@ fn HexTile(
 }
 
 /// Whose turn, turn number, placements, the queen hint, the forced-`Pass`
-/// affordance, a "Thinking…" indicator while the AI searches, and "New Game".
+/// affordance, a "Thinking…" indicator while the AI searches, the analysis
+/// toggle, and "New Game".
 #[component]
 fn StatusPanel(
     session: RwSignal<Session>,
     selection: RwSignal<Option<Selection>>,
-    ai_thinking: RwSignal<bool>,
-    ai_depth: RwSignal<u8>,
+    ai: AiSignals,
     setup: GameSetup,
     on_new_game: Callback<()>,
 ) -> impl IntoView {
@@ -943,14 +1084,33 @@ fn StatusPanel(
     // pass internally) and not while the AI is thinking.
     let forced_pass = move || {
         !is_over()
-            && !ai_thinking.get()
+            && !ai.thinking.get()
             && session.get().state().side_to_move() == setup.human
             && LegalMoveIndex::from_state(session.get().state()).is_forced_pass()
     };
     let on_pass = move |_| {
-        apply_move_and_trigger_ai(session, selection, Move::Pass, setup, ai_thinking, ai_depth);
+        apply_move_and_trigger_ai(session, selection, Move::Pass, setup, ai);
     };
     let new_game = move |_| on_new_game.call(());
+
+    // Turning analysis on mid-think costs nothing: the AI's own search is
+    // already reporting, and a ponder starts only if the human is on move.
+    let toggle_analysis = move |_| {
+        let now_on = !ai.analysis_on.get_untracked();
+        ai.analysis_on.set(now_on);
+        if now_on {
+            maybe_start_ponder(session, setup, ai);
+        } else {
+            stop_ponder(ai);
+        }
+    };
+    let analysis_class = move || {
+        if ai.analysis_on.get() {
+            "opt-btn active"
+        } else {
+            "opt-btn"
+        }
+    };
 
     view! {
         <section class="status" aria-label="game status">
@@ -988,18 +1148,106 @@ fn StatusPanel(
                     })
             }}
             {move || {
-                ai_thinking.get().then(|| {
+                ai.thinking.get().then(|| {
                     // Depth 0 means no iteration has completed yet (or the move
                     // was forced); showing "depth 0" would be a lie, so the
                     // bare label stands in until the first real depth lands.
-                    let label = move || match ai_depth.get() {
+                    let label = move || match ai.depth.get() {
                         0 => "Thinking\u{2026}".to_string(),
                         d => format!("Thinking\u{2026} depth {d}"),
                     };
                     view! { <span class="status-hint thinking">{label}</span> }
                 })
             }}
+            <button
+                class=analysis_class
+                title="Let the engine keep searching while you think, and warn about forced wins"
+                aria-pressed=move || if ai.analysis_on.get() { "true" } else { "false" }
+                on:click=toggle_analysis
+            >
+                "Analysis"
+            </button>
             <button class="ctrl-btn" on:click=new_game>"New Game"</button>
+        </section>
+    }
+}
+
+/// What the engine has proven about the position in front of the player.
+///
+/// Makes exactly one claim, and only when it can back it: a forced win for one
+/// side or the other. The rest of the time it reports what it is doing — the
+/// depth it has reached and that it has found nothing forced — which is a
+/// statement about the *search*, not a verdict on the position.
+///
+/// There is deliberately no score. The engine's number is in the units of its
+/// own evaluation terms, uncalibrated against real outcomes; shown to a player
+/// it would look authoritative while being a guess.
+#[component]
+fn AnalysisPanel(ai: AiSignals, setup: GameSetup) -> impl IntoView {
+    let busy = move || ai.thinking.get() || ai.pondering.get();
+
+    // Depth of whichever search is running: the AI's during its turn, the
+    // ponder's during the human's.
+    let depth = move || {
+        if ai.thinking.get() {
+            ai.depth.get()
+        } else {
+            ai.ponder_depth.get()
+        }
+    };
+
+    let forced = move || ai.analysis.get().and_then(|a| a.forced);
+
+    let status = move || match (forced(), depth(), busy()) {
+        // Proven: say at what depth, so the claim is attributable.
+        (Some(_), _, _) => {
+            let d = ai.analysis.get().map(|a| a.depth).unwrap_or_else(depth);
+            format!("Proven at depth {d}")
+        }
+        (None, 0, true) => "Searching\u{2026}".to_string(),
+        (None, 0, false) => "Idle".to_string(),
+        // "no forced win found" is a fact about how far the search got. It is
+        // not "the position is equal", and must not be phrased as if it were.
+        (None, d, true) => format!("Searching\u{2026} depth {d} \u{00b7} no forced win found"),
+        (None, d, false) => format!("Depth {d} \u{00b7} no forced win found"),
+    };
+
+    let verdict = move || {
+        forced().map(|f| {
+            let moves = f.moves;
+            let plural = if moves == 1 { "move" } else { "moves" };
+            let yours = f.winner == setup.human;
+            let text = if yours {
+                format!("You have a forced win in {moves} {plural}")
+            } else {
+                format!("The engine has a forced win in {moves} {plural}")
+            };
+            let class = if yours {
+                "analysis-forced good"
+            } else {
+                "analysis-forced"
+            };
+            view! { <span class=class>{text}</span> }
+        })
+    };
+
+    view! {
+        <section class="analysis" aria-label="engine analysis" aria-live="polite">
+            <span class="eyebrow">"Engine watch"</span>
+            {verdict}
+            <span class=move || {
+                if busy() { "analysis-meta thinking" } else { "analysis-meta" }
+            }>{status}</span>
+            {move || {
+                (!ai.analysis_ok.get())
+                    .then(|| {
+                        view! {
+                            <span class="analysis-meta">
+                                "Background analysis unavailable in this browser"
+                            </span>
+                        }
+                    })
+            }}
         </section>
     }
 }

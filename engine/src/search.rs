@@ -701,6 +701,27 @@ mod tests {
     }
 
     #[test]
+    fn terminal_score_encodes_distance_to_mate() {
+        // The convention a caller decodes to say "forced win in N moves": the
+        // magnitude is MATE_SCORE - ply, signed by whether the winner is the
+        // side to move. The UI's analysis panel reads mate distance straight
+        // off this, so pin it here rather than leaving it implicit.
+        for ply in [0u32, 1, 4] {
+            let mag = MATE_SCORE - ply as i32;
+            assert_eq!(
+                terminal_score(Outcome::Win(Color::White), Color::White, ply),
+                mag
+            );
+            assert_eq!(
+                terminal_score(Outcome::Win(Color::White), Color::Black, ply),
+                -mag
+            );
+            assert!(mag.abs() >= MATE_THRESHOLD, "a mate must read as a mate");
+        }
+        assert_eq!(terminal_score(Outcome::Draw, Color::White, 3), 0);
+    }
+
+    #[test]
     fn search_near_terminal_returns_non_pass_move() {
         let mut s = State::new();
         s.apply(Move::Place { piece: PieceId(0),  to: Coord::ORIGIN        }); // WQ

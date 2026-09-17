@@ -103,6 +103,22 @@ cd ui
 trunk serve          # dev server at http://localhost:8080 with live reload
 ```
 
+### Analysis mode
+
+An **Analysis** toggle in the in-game status bar puts the engine to work during
+your turn: while you think, it searches the position on the board looking for a
+forced win, and warns you the moment it proves one ("The engine has a forced win
+in 2 moves"). The rest of the time it reports the depth it has reached and that
+it has found nothing forced.
+
+It shows **no evaluation score**, deliberately. The engine's number is in the
+units of its own evaluation terms and is not calibrated against real outcomes, so
+it would look authoritative while being a guess. A forced win is the one thing
+the search can state without qualification.
+
+The search runs on a second Web Worker, so the AI's own thinking is never delayed
+by it. Off by default: it costs a CPU core while you think.
+
 ### Production build
 
 ```bash
