@@ -48,9 +48,29 @@ Phases 1–5 are done (correctness + Zobrist + make-unmake + incremental caches 
 - PR #19 — `Eval` trait (static dispatch) plus `examples/gauntlet.rs`, a self-play harness with randomised openings and colour-swapped pairs.
 - PRs #20–#23 — evaluation and move ordering: convex owner-agnostic queen-surround, beetle-on-queen, killer moves. Together **61.1% ± 3.7% over 180 games** against the previous evaluation, and depth 6 from 105,879 nodes / 84.6ms to 44,584 / 37.3ms.
 
+**First external benchmark (2026-09-17).** Until now every strength number was self-play against an older version of ourselves, which measures progress but not level. Against [janpfeifer/hiveGo](https://github.com/janpfeifer/hiveGo) at its own default 3 s/move control, 100 games per opponent with colours swapped:
+
+| hiveGo opponent | score | Elo |
+|---|---|---|
+| `linear,ab` — hand-tuned linear eval | 71.0% ± 4.0% | +155 |
+| `fnn=#0,ab` — pretrained neural eval | 78.5% ± 3.7% | +225 |
+| `a0fnn=#0,mcts` — AlphaZero net + MCTS | 67.5% ± 4.1% | +127 |
+
+We are stronger than every AI that engine ships. Two results matter more than the scoreline:
+
+- **We convert time into strength poorly.** 30× the budget (100 ms → 3 s) bought ~1.6 extra plies — depth 3.3–4.0 → 5.2–5.6 — on 30× the nodes (~21k → ~650k per move). Every margin above fell 7.5–15.5 points versus the same matches at 100 ms, *including* against their cheapest evaluator, so this is not the cost of neural evaluation on their side. It is Hive's branching factor, and it means an opponent who searches better gains more from a long control than we do.
+- **Our move generator is validated against an independent implementation.** 78k+ plies of random playout agree exactly, after the cross-check found a genuine rules bug — in hiveGo, not in us (their beetle never applies freedom-to-move at height). This is stronger correctness evidence than perft against ourselves.
+
 **Evaluation changes are gated on gauntlet win rate, not node counts** — Hive has no captures, so material is constant and essentially all strength lives in the evaluation. A change can cut nodes and play worse. Budget ~180 games (two seeds pooled, 100ms/move) for roughly ±3.7% at 1 s.e.; smaller runs mislead (an 80-game run read 55% where 300 games put the same change at 48.5%).
 
-Open engine follow-ups, in rough value order: **repetition detection** (games hit the 300-ply cap and dilute every future gauntlet number), the `killer_moves` slot-ordering bug in `search.rs` (killers are pushed in `moves` order, so killer[1] can precede the more recent killer[0]), deleting the now-beaten `LegacyEval` scaffold, and `examples/match.rs` — its "10 games" are one deterministic game tallied ten times.
+Open engine follow-ups, in rough value order — **reordered by the external benchmark, which moved search efficiency above evaluation work**:
+
+1. **Search efficiency — now the highest-value area.** 1.6 plies per 30× time is the measured symptom; the cause is that we widen rather than deepen. Concretely: the `killer_moves` slot-ordering bug in `search.rs` (killers are pushed in `moves` order, so killer[1] can precede the more recent killer[0]), then late-move reductions and aspiration windows. This is where strength against a *searching* opponent lives, and it is not visible in self-play at a fixed control, because both sides scale equally badly.
+2. **Repetition detection.** Now has a price tag: 12 of 52 draws in the external series, and every opponent there can see repetitions while our search cannot — so we walk into loops we are unable to evaluate. Also still dilutes gauntlet numbers via the 300-ply cap.
+3. Delete the now-beaten `LegacyEval` scaffold.
+4. `examples/match.rs` — its "10 games" are one deterministic game tallied ten times.
+
+**Evaluation tuning is no longer the obvious next lever.** It was, when the only yardstick was our own previous evaluation; the external result says the search is the weaker half.
 
 Full phase plan and project memory: `~/.claude/projects/-home-gregor-Repos-Hivemind-rust/memory/`.
 
