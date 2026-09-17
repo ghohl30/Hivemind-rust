@@ -69,8 +69,9 @@ pub use search::{
 };
 
 // Evaluation, behind a trait so two variants can be compared head-to-head.
-// `LegacyEval` is temporary A/B scaffolding — see its doc comment.
-pub use eval::{CurrentEval, Eval, LegacyEval};
+// `LegacyEval` and `CoverEval` are temporary A/B scaffolding — see their doc
+// comments.
+pub use eval::{CoverEval, CurrentEval, Eval, LegacyEval};
 
 // Native-only: wall-clock wrapper around `search_bounded`. Absent on wasm32 by
 // design — see its doc comment.

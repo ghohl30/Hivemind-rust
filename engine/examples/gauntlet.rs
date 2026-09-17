@@ -1,10 +1,13 @@
 //! Self-play strength testing: two evaluations, equal time, many games.
 //!
 //!     cargo run --release --example gauntlet -- [--openings N] [--ms MS] [--seed S]
+//!                                                [--baseline cover|legacy]
 //!
-//! Defaults: 50 openings (= 100 games), 300ms per move, seed 1.
+//! Defaults: 50 openings (= 100 games), 300ms per move, seed 1, baseline
+//! `cover`.
 //!
-//! Reports the win rate of `CurrentEval` against `LegacyEval`. This is the only
+//! Reports the win rate of `CurrentEval` against the chosen baseline arm. This
+//! is the only
 //! evidence that an evaluation change actually made the engine stronger — node
 //! counts cannot tell you that, and a change can cut nodes while playing worse.
 //!
@@ -27,7 +30,8 @@ use std::env;
 use std::time::{Duration, Instant};
 
 use hive_engine::{
-    play_game_from, CurrentEval, LegacyEval, Move, Outcome, State, TimedSearchPlayer,
+    play_game_from, CoverEval, CurrentEval, Eval, LegacyEval, Move, Outcome, State,
+    TimedSearchPlayer,
 };
 
 /// splitmix64. The crate has no `rand` dependency and its Zobrist mixer is
@@ -102,12 +106,34 @@ fn main() {
     let ms: u64 = arg("--ms").and_then(|s| s.parse().ok()).unwrap_or(300);
     let seed: u64 = arg("--seed").and_then(|s| s.parse().ok()).unwrap_or(1);
     let opening_plies: usize = arg("--opening-plies").and_then(|s| s.parse().ok()).unwrap_or(6);
+    let baseline = arg("--baseline").unwrap_or_else(|| "cover".to_string());
+
+    // Monomorphised per arm rather than boxed: `negamax` is generic over `Eval`
+    // precisely so the evaluation is inlined into the hot path, and a dynamic
+    // baseline would quietly charge one arm for a vtable the other does not pay.
+    match baseline.as_str() {
+        "cover" => run::<CoverEval>("CoverEval", openings, ms, seed, opening_plies),
+        "legacy" => run::<LegacyEval>("LegacyEval", openings, ms, seed, opening_plies),
+        other => {
+            eprintln!("unknown --baseline {other:?} (expected \"cover\" or \"legacy\")");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn run<B: Eval>(
+    baseline_name: &str,
+    openings: usize,
+    ms: u64,
+    seed: u64,
+    opening_plies: usize,
+) {
     const MAX_PLIES: u32 = 300;
     const TT_LOG2: u32 = 18;
 
     let budget = Duration::from_millis(ms);
 
-    println!("gauntlet: CurrentEval vs LegacyEval");
+    println!("gauntlet: CurrentEval vs {baseline_name}");
     println!(
         "{} openings x 2 colours = {} games, {}ms/move, seed {}, {} random opening plies",
         openings,
@@ -138,7 +164,7 @@ fn main() {
             // Fresh players per game so no transposition table carries over and
             // silently advantages whoever moved second.
             let mut cur = TimedSearchPlayer::<CurrentEval>::new(budget, TT_LOG2);
-            let mut leg = TimedSearchPlayer::<LegacyEval>::new(budget, TT_LOG2);
+            let mut leg = TimedSearchPlayer::<B>::new(budget, TT_LOG2);
 
             let result = if swap {
                 play_game_from(opening.clone(), &mut leg, &mut cur, MAX_PLIES)
