@@ -581,3 +581,152 @@ fn worker_messages_round_trip_through_json() {
     let decoded: WorkerMessage = serde_json::from_str(&progress_json).unwrap();
     assert!(matches!(decoded, WorkerMessage::Progress { .. }));
 }
+
+// ---- analysis: what the engine has proven ----------------------------------
+
+#[test]
+fn no_completed_iteration_is_not_an_assessment() {
+    // The engine reports `depth: 0` with a placeholder score when a move was
+    // forced. That is not a search result, and must not be confused with a
+    // completed search that found no forced win.
+    assert_eq!(Assessment::from_search(0, Color::White, 0), None);
+    assert_eq!(Assessment::from_search(500, Color::Black, 0), None);
+}
+
+#[test]
+fn an_ordinary_score_proves_nothing_however_large() {
+    use hive_engine::MATE_THRESHOLD;
+
+    // Everything below the threshold is a heuristic judgement. The panel says
+    // "no forced win found", which is a fact about the search — not "equal".
+    for score in [0, -40, 250, MATE_THRESHOLD - 1, -(MATE_THRESHOLD - 1)] {
+        let a = Assessment::from_search(score, Color::White, 8).unwrap();
+        assert_eq!(a.forced, None, "score {score} should prove nothing");
+        assert_eq!(a.depth, 8);
+    }
+
+    // The threshold itself is a mate.
+    assert!(Assessment::from_search(MATE_THRESHOLD, Color::White, 8)
+        .unwrap()
+        .forced
+        .is_some());
+}
+
+#[test]
+fn a_mate_score_names_the_winner_and_the_distance() {
+    use hive_engine::MATE_SCORE;
+
+    // White to move, mate in 3 plies: White wins, stated as 2 of its own moves
+    // (it moves on plies 1 and 3).
+    let forced = Assessment::from_search(MATE_SCORE - 3, Color::White, 6)
+        .unwrap()
+        .forced
+        .expect("a mate score is a forced result");
+    assert_eq!(forced.winner, Color::White);
+    assert_eq!(forced.plies, 3);
+    assert_eq!(forced.moves, 2);
+
+    // The same magnitude with Black to move belongs to Black: the raw score is
+    // always from the mover's side, so the perspective has to be undone first.
+    let forced = Assessment::from_search(MATE_SCORE - 3, Color::Black, 6)
+        .unwrap()
+        .forced
+        .unwrap();
+    assert_eq!(forced.winner, Color::Black);
+
+    // A losing score names the *other* side as the winner, and an even ply
+    // count halves exactly.
+    let forced = Assessment::from_search(-(MATE_SCORE - 4), Color::White, 6)
+        .unwrap()
+        .forced
+        .unwrap();
+    assert_eq!(forced.winner, Color::Black);
+    assert_eq!(forced.plies, 4);
+    assert_eq!(forced.moves, 2);
+}
+
+#[test]
+fn mate_distance_rounds_up_to_whole_moves() {
+    use hive_engine::MATE_SCORE;
+
+    // Mate in 1 ply is one move, not half a one; 5 plies is 3.
+    let moves_for = |plies: i32| {
+        Assessment::from_search(MATE_SCORE - plies, Color::White, 9)
+            .unwrap()
+            .forced
+            .unwrap()
+            .moves
+    };
+    assert_eq!(moves_for(1), 1);
+    assert_eq!(moves_for(2), 1);
+    assert_eq!(moves_for(3), 2);
+    assert_eq!(moves_for(5), 3);
+}
+
+#[test]
+fn a_real_search_produces_a_readable_assessment() {
+    // End to end through the engine rather than synthetic scores: whatever a
+    // real search returns has to decode without panicking, and an opening
+    // position must not claim a forced win.
+    let session = play_first_legal(6);
+    let result = search_with_clock(session.moves(), budget_for(16), fake_clock());
+    let assessment = Assessment::from_search(
+        result.score,
+        session.state().side_to_move(),
+        result.stats.depth,
+    )
+    .expect("a completed search is an assessment");
+    assert!(assessment.depth >= 1);
+    assert_eq!(
+        assessment.forced, None,
+        "no side has a forced win six plies into the game"
+    );
+}
+
+// ---- analysis: a forced win in a real position -----------------------------
+
+/// A complete game the engine actually played (a depth-4 search against a
+/// deterministic random opponent), ending in a win for White. Frozen as a move
+/// list because that is the only portable representation of a position — and
+/// because `Session::from_moves` re-validates every move, so the fixture cannot
+/// silently rot into an illegal sequence.
+const FINISHED_GAME: &str = include_str!("fixtures/forced_win.json");
+
+fn finished_game() -> Vec<Move> {
+    serde_json::from_str(FINISHED_GAME).expect("fixture parses")
+}
+
+#[test]
+fn the_fixture_is_a_legal_game_that_white_wins() {
+    let moves = finished_game();
+    let session = Session::from_moves(&moves).expect("every move must still be legal");
+    assert_eq!(
+        session.outcome(),
+        Some(hive_engine::Outcome::Win(Color::White))
+    );
+}
+
+#[test]
+fn a_losing_position_is_reported_as_the_opponents_forced_win() {
+    // One ply before the end: Black to move and lost. This is the case the
+    // panel exists for — a warning aimed at the player who is about to be
+    // surrounded — and it exercises the perspective inversion, since the raw
+    // score is a *negative* mate from Black's point of view.
+    let moves = finished_game();
+    let session = Session::from_moves(&moves[..moves.len() - 1]).expect("prefix is legal");
+    assert!(!session.is_over());
+    assert_eq!(session.state().side_to_move(), Color::Black);
+
+    let mut state = replay(session.moves());
+    let mut tt = hive_engine::TranspositionTable::with_capacity_log2(16);
+    let (score, _best, stats) = hive_engine::search(&mut state, 4, &mut tt);
+
+    let assessment = Assessment::from_search(score, session.state().side_to_move(), stats.depth)
+        .expect("a completed search is an assessment");
+    let forced = assessment
+        .forced
+        .expect("a mate four plies out must be proven at depth 4");
+    assert_eq!(forced.winner, Color::White, "Black is the one losing here");
+    assert_eq!(forced.plies, 4);
+    assert_eq!(forced.moves, 2, "stated in the winner's own moves");
+}

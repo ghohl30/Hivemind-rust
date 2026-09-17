@@ -102,6 +102,44 @@
         font-weight: 600;
       }
 
+      /* Analysis panel: what the engine has proven about the position, shown
+         only while the analysis toggle is on. Same frosted treatment as the
+         status bar so it reads as a second row of the same instrument. There is
+         no score and no gauge here on purpose — the panel either has a proof to
+         report or says what the search is doing. */
+      .analysis {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.4rem 1.2rem;
+        padding: 0.6rem 1.1rem;
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 18px;
+        box-shadow: var(--shadow);
+        -webkit-backdrop-filter: blur(10px);
+        backdrop-filter: blur(10px);
+        font-variant-numeric: tabular-nums;
+      }
+      .analysis-meta {
+        font-size: 0.82rem;
+        color: var(--ink-soft);
+      }
+      /* The one claim the panel ever makes, so it gets the accent: burnt orange
+         when the engine has the win (a warning), gold when the player does. */
+      .analysis-forced {
+        padding: 0.25rem 0.85rem;
+        border-radius: 999px;
+        background: var(--accent);
+        color: #f6efe3;
+        font-weight: 700;
+        font-size: 0.92rem;
+      }
+      .analysis-forced.good {
+        background: var(--gold);
+        color: var(--ink);
+      }
+
       /* Play area: hands flank the board on wide screens, stack on narrow. */
       .play-area {
         flex: 1;
