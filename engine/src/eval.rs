@@ -7,9 +7,9 @@
 //!
 //! [`Eval`] is a static-dispatch trait: implementations are zero-sized and
 //! `negamax` is generic over them, so a variant costs a monomorphisation rather
-//! than a branch in the hottest path in the program. [`LegacyEval`] is a frozen
-//! snapshot used only as the gauntlet's control arm; it is scaffolding and
-//! should be deleted once the current evaluation has been shown to beat it.
+//! than a branch in the hottest path in the program. [`LegacyEval`] and
+//! [`CoverEval`] are frozen snapshots used only as the gauntlet's control arms;
+//! both are scaffolding and should be deleted once they have been beaten.
 
 use crate::piece::{queen_of, Color, PieceSlot};
 use crate::state::State;
@@ -26,6 +26,15 @@ pub trait Eval {
 
 /// The evaluation the engine actually plays with.
 pub struct CurrentEval;
+
+/// Frozen control arm for the beetle-cover A/B: `CurrentEval` plus the
+/// beetle-on-queen term that this branch removes.
+///
+/// Shares [`QUEEN_ADJ`] with `CurrentEval` on purpose — unlike [`LegacyEval`],
+/// which is a snapshot of a whole older evaluation, this arm exists to isolate
+/// exactly one term, so everything else must stay literally identical.
+/// **Temporary**: delete whichever of the two loses the gauntlet.
+pub struct CoverEval;
 
 /// Frozen control arm for A/B testing — the single-term evaluation the engine
 /// shipped with before this series of changes.
@@ -72,9 +81,10 @@ impl Eval for LegacyEval {
 /// `MATE_THRESHOLD` so a heuristic score is never read as a forced mate.
 const QUEEN_ADJ: [i32; 7] = [0, 6, 15, 30, 56, 96, 160];
 
+/// Danger to a queen from an *enemy* beetle sitting on it, in [`CoverEval`].
 const ENEMY_COVER: i32 = 90;
 
-/// Danger from your *own* beetle sitting on your queen.
+/// Danger from your *own* beetle sitting on your queen, in [`CoverEval`].
 ///
 /// Still bad — the queen cannot move — but you control when it steps off, so
 /// it is a self-inflicted tempo problem rather than a hostage situation.
@@ -88,26 +98,35 @@ impl Eval for CurrentEval {
         // queen's danger above the opponent's is a second, independent
         // defensive bias, and stacking it on the ownership asymmetry above
         // would make two knobs move at once. Left for the gauntlet to settle.
-        queen_danger(state, opp) - queen_danger(state, stm)
+        ring_danger(state, opp) - ring_danger(state, stm)
     }
 }
 
-/// How close `color`'s queen is to being surrounded, weighted by who owns each
-/// adjacent piece. Higher is worse for `color`.
-fn queen_danger(state: &State, color: Color) -> i32 {
-    let (enemy, own) = queen_ring(state, color);
-    QUEEN_ADJ[(enemy + own) as usize] + cover_danger(state, color)
+impl Eval for CoverEval {
+    fn evaluate(state: &State) -> i32 {
+        let stm = state.side_to_move();
+        let opp = stm.other();
+        let danger = |c| ring_danger(state, c) + cover_danger(state, c);
+        danger(opp) - danger(stm)
+    }
 }
 
-/// Danger to `color`'s queen from being buried under a beetle.
+/// How close `color`'s queen is to being surrounded. Higher is worse for
+/// `color`, and every neighbour counts the same whoever owns it.
+fn ring_danger(state: &State, color: Color) -> i32 {
+    let (enemy, own) = queen_ring(state, color);
+    QUEEN_ADJ[(enemy + own) as usize]
+}
+
+/// Danger to `color`'s queen from being buried under a beetle. Used only by
+/// [`CoverEval`].
 ///
 /// This is a boolean term, which is the shape that wrecked the opponent-mobility
-/// experiment on the earlier eval branch (a 4x node-count blowup). It is
-/// tolerable here for two reasons the mobility term could not claim: it flips
-/// only on a deliberate, rare climb onto one specific stack rather than as a
-/// side effect of an unrelated game-phase condition, and its magnitude is in
-/// scale with the ring tables rather than orders of magnitude larger. Node count
-/// is checked on every change regardless.
+/// experiment on the earlier eval branch (a 4x node-count blowup). It flips only
+/// on a deliberate, rare climb onto one specific stack rather than as a side
+/// effect of an unrelated game-phase condition, and its magnitude is in scale
+/// with the ring tables — but whether it is worth its complexity at all is what
+/// the gauntlet on this branch decides.
 fn cover_danger(state: &State, color: Color) -> i32 {
     let q = queen_of(color);
     // `Covered` is precisely "something is stacked on this piece" — no board
@@ -268,6 +287,36 @@ mod tests {
             cover_danger(&s, Color::White),
             0,
             "white's queen is uncovered again once the beetle leaves"
+        );
+    }
+
+    /// The point of this branch: `CurrentEval` must be blind to a beetle
+    /// sitting on a queen, and `CoverEval` must not be. If these two ever agree,
+    /// the gauntlet is comparing an evaluation to itself.
+    #[test]
+    fn only_the_control_arm_scores_a_covered_queen() {
+        let mut s = State::new();
+        play(&mut s, Move::Place { piece: PieceId(0), to: Coord::ORIGIN });      // WQ
+        play(&mut s, Move::Place { piece: PieceId(11), to: Coord::new(1, 0) });  // BQ
+        play(&mut s, Move::Place { piece: PieceId(1), to: Coord::new(-1, 0) });  // W beetle
+        play(&mut s, Move::Place { piece: PieceId(12), to: Coord::new(2, 0) });  // B beetle
+        // Two hops, because a beetle can only climb a stack it already touches.
+        play(&mut s, Move::Slide { piece: PieceId(1), to: Coord::ORIGIN });      // onto WQ
+        play_any(&mut s); // black, don't care
+        play(&mut s, Move::Slide { piece: PieceId(1), to: Coord::new(1, 0) });   // onto BQ
+
+        let stm = s.side_to_move();
+        let opp = stm.other();
+
+        assert_eq!(
+            CurrentEval::evaluate(&s),
+            ring_danger(&s, opp) - ring_danger(&s, stm),
+            "CurrentEval must be the ring term and nothing else"
+        );
+        assert_ne!(
+            CoverEval::evaluate(&s),
+            CurrentEval::evaluate(&s),
+            "CoverEval must still price the beetle on the black queen"
         );
     }
 
